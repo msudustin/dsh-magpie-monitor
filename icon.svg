@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="14" fill="#0f172a"/>
+  <!-- long graduated tail -->
+  <path d="M30 36 C24 42 16 47 8 50" fill="none" stroke="#38bdf8" stroke-width="4.5" stroke-linecap="round"/>
+  <path d="M31 39 C27 45 21 50 14 54" fill="none" stroke="#f8fafc" stroke-width="3.5" stroke-linecap="round" opacity="0.9"/>
+  <!-- white belly -->
+  <path d="M28 33 C26 24 33 15 43 16 C51 17 55 24 53 30 C51 38 41 43 33 41 C30 40 28 37 28 33 Z" fill="#f8fafc"/>
+  <!-- dark back and head -->
+  <path d="M29 30 C29 22 36 15 44 16 C51 17 55 23 53 29 C47 26 36 27 29 30 Z" fill="#1e293b"/>
+  <path d="M44 16 C48 14 52 15 54 18 C55 20 55 23 53 25 C50 22 47 19 44 16 Z" fill="#1e293b"/>
+  <!-- blue wing sheen -->
+  <path d="M33 30 C37 27 44 27 49 29 C46 33 40 35 35 34 Z" fill="#38bdf8" opacity="0.85"/>
+  <!-- eye and beak -->
+  <circle cx="48.5" cy="20.5" r="1.8" fill="#f8fafc"/>
+  <path d="M54 21 L61 23.5 L54 26 Z" fill="#f59e0b"/>
+</svg>

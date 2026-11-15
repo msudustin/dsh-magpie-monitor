@@ -1,0 +1,5 @@
+# Mount the Magpie Monitor host half (read-only gateway proxy routes).
+- insert:
+    - id: magpie-monitor
+      name: '@local/dsh-magpie-monitor'
+      config: {}

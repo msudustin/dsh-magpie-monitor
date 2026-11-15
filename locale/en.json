@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Magpie Monitor",
+    "description": "Sidebar panel showing live request routing, usage totals, daily activity and provider account quotas from the local Magpie gateway."
+  }
+}

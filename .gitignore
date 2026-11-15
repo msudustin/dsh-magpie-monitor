@@ -1,0 +1,6 @@
+node_modules/
+pnpm-lock.yaml
+.plugin-manager/
+*.log
+.DS_Store
+Thumbs.db
