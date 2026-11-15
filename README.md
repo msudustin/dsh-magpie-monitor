@@ -1,5 +1,7 @@
 # dsh-magpie-monitor
 
+[![CI](https://github.com/msudustin/dsh-magpie-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/msudustin/dsh-magpie-monitor/actions/workflows/ci.yml)
+
 > DeepSeek Harness **sidebar-footer widget** (in the style of `dsh-cost-meter`)
 > that shows the local **Magpie gateway** in real time, pinned to the bottom of the
 > sidebar above the settings row.
