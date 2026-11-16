@@ -1,9 +1,9 @@
 {
   "name": "@local/dsh-magpie-monitor",
-  "version": "1.6.11",
+  "version": "1.8.0",
   "private": true,
   "type": "module",
-  "description": "Magpie Monitor for DeepSeek Harness: a sidebar panel showing live request routing (requested vs served model), usage totals, daily activity and provider account quotas from the local Magpie gateway.",
+  "description": "Magpie Monitor for DeepSeek Harness: a sidebar panel showing live request routing (requested vs served model), usage totals, daily activity and provider account quotas from the local Magpie gateway, plus a task-done alert with Magpie's own rule and sound.",
   "license": "MIT",
   "author": "msudustin",
   "homepage": "https://github.com/msudustin/dsh-magpie-monitor#readme",
@@ -47,7 +47,8 @@
     "icon.svg",
     "README.md",
     "icons",
-    "tools/embed-icons.mjs"
+    "tools/embed-icons.mjs",
+    "tools/flash-taskbar.ps1"
   ],
   "peerDependencies": {
     "@deepseek-ai/schemastery": ">=3.18.4 <4"

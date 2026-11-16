@@ -7,6 +7,8 @@
 //   GET /magpie-monitor/api/config            -> effective settings
 //   GET /magpie-monitor/api/data?path=<key>   -> one raw upstream payload
 //   GET /magpie-monitor/api/snapshot          -> merged, trimmed, cached view
+//   GET /magpie-monitor/api/alert-sound       -> one of the system wavs (?tone=)
+//   POST /magpie-monitor/api/alert-flash      -> blink the taskbar button
 //
 // The snapshot is the whole data source for both the sidebar widget and the
 // `magpie_usage` agent tool, so the panel and the model read one implementation
@@ -16,6 +18,8 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { spawn } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import z from '@deepseek-ai/schemastery'
 
 export const Config = z.object({
@@ -49,11 +53,31 @@ export const Config = z.object({
   /** Register the magpie_usage agent tool alongside the panel. */
   tool: z.boolean().default(true).volatile()
     .description('是否注册 magpie_usage 代理工具，默认 true'),
+  /**
+   * Magpie's own "Task done alert" (its prefs field is turnDoneAlert): ring when
+   * a task that ran at least this long finishes. Seconds; 0 turns it off. The
+   * panel offers Magpie's 1 / 3 / 10 minutes and accepts any other value.
+   */
+  turnDoneAlert: z.number().default(0).volatile()
+    .description('任务完成提醒阈值（秒）：一次任务跑了至少这么久才提醒，0 关闭；与 Magpie 的 Task done alert 一致，默认 0'),
+  /**
+   * Which of the machine's own wavs the alert rings. Magpie rides the
+   * Windows "Notification" event, whose stock sound is a 1.3 s chime that is
+   * easy to miss; the panel keeps that one and defaults to the loudest
+   * pattern Windows ships. Everything comes out of %SystemRoot%\media.
+   */
+  alertTone: z.string().default('alarm').volatile()
+    .description('提醒音色：alarm（警报，默认）/ ring（铃声）/ bell（钟声）/ chime（系统通知音），都取自 Windows 自带 wav'),
+  /** Blink the taskbar button when the alert rings, the way Magpie flashes. */
+  alertFlash: z.boolean().default(true).volatile()
+    .description('任务完成时闪烁 DSH 的任务栏按钮（Windows），默认 true'),
 })
 
 const CONFIG_ROUTE = '/magpie-monitor/api/config'
 const DATA_ROUTE = '/magpie-monitor/api/data'
 const SNAPSHOT_ROUTE = '/magpie-monitor/api/snapshot'
+const ALERT_ROUTE = '/magpie-monitor/api/alert-sound'
+const ALERT_FLASH_ROUTE = '/magpie-monitor/api/alert-flash'
 
 const UPSTREAM = {
   root: '/',
@@ -251,6 +275,137 @@ function stamp(value) {
   const n = typeof value === 'number' ? value : Number.NaN
   if (!Number.isFinite(n) || n <= 0) return undefined
   return new Date(n < 1e12 ? n * 1000 : n).toISOString()
+}
+
+/** Env override for the alert wav, for machines without the stock sound. */
+const ALERT_SOUND_ENV = 'MAGPIE_MONITOR_ALERT_WAV'
+
+/**
+ * The wavs this panel may ring, best first per tone, all of them files
+ * Windows ships. `chime` is what Magpie's toast actually plays — the
+ * "Notification.Default" app event points at Windows Notify System Generic —
+ * so it stays available, but the default is a longer alarm pattern because a
+ * 1.3 s chime is easy to miss when you are looking at another window.
+ */
+const ALERT_TONES = {
+  alarm: ['Alarm01.wav', 'Alarm02.wav', 'Alarm03.wav'],
+  ring: ['Ring05.wav', 'Ring02.wav', 'Ring01.wav'],
+  bell: ['Windows Notify Calendar.wav', 'Windows Notify Email.wav', 'Windows Foreground.wav'],
+  chime: ['Windows Notify System Generic.wav', 'Windows Notify.wav', 'notify.wav'],
+}
+const ALERT_TONE_ORDER = ['alarm', 'ring', 'bell', 'chime']
+const ALERT_TONE_DEFAULT = 'alarm'
+
+/** A tone name from config or a query string, minus anything unrecognised. */
+function alertToneKey(value) {
+  const key = str(value)
+  return key !== undefined && Object.prototype.hasOwnProperty.call(ALERT_TONES, key) ? key : ALERT_TONE_DEFAULT
+}
+
+/** `?tone=` on the alert-sound route, falling back to the configured tone. */
+function alertToneParam(req, fallback) {
+  try {
+    const url = new URL(req?.url || '/', 'http://localhost')
+    const asked = url.searchParams.get('tone')
+    return asked === null ? fallback : alertToneKey(asked)
+  } catch {
+    return fallback
+  }
+}
+
+/**
+ * Where the alert wav may live, best first.
+ *
+ * Magpie raises a Windows toast with `ms-winsoundevent:Notification.Default`,
+ * so what the user actually hears is the file the Notification app event points
+ * at — on a stock install `%SystemRoot%\media\Windows Notify System Generic.wav`.
+ * Serving that same file lets the panel ring exactly like Magpie instead of
+ * shipping a tone of its own.
+ */
+function alertSoundCandidates(tone) {
+  const out = []
+  const override = str(process.env[ALERT_SOUND_ENV])
+  if (override) out.push(override)
+  const media = path.join(str(process.env.SystemRoot) || 'C:\\Windows', 'media')
+  for (const name of ALERT_TONES[alertToneKey(tone)]) out.push(path.join(media, name))
+  // A machine missing this tone still rings the file Magpie would have
+  // played, so the alert degrades to the stock chime instead of silence.
+  if (alertToneKey(tone) !== 'chime') {
+    for (const name of ALERT_TONES.chime) out.push(path.join(media, name))
+  }
+  return out
+}
+
+/** tone -> { file, bytes } | null, read once per tone. @type {Map<string, { file: string, bytes: Buffer } | null>} */
+const alertSoundCache = new Map()
+
+/** The notification wav, read once; null when this machine has none. */
+function alertSound(tone) {
+  const key = alertToneKey(tone)
+  if (alertSoundCache.has(key)) return alertSoundCache.get(key)
+  for (const candidate of alertSoundCandidates(key)) {
+    try {
+      const bytes = fs.readFileSync(candidate)
+      // 44 bytes is a bare wav header; anything shorter is not a sound, and a
+      // file without RIFF is not one we can hand to an <audio> element.
+      if (bytes.length > 44 && bytes.toString('latin1', 0, 4) === 'RIFF') {
+        const found = { file: candidate, bytes }
+        alertSoundCache.set(key, found)
+        return found
+      }
+    } catch {
+      /* not here — try the next candidate */
+    }
+  }
+  alertSoundCache.set(key, null)
+  return null
+}
+
+/** tone -> whether this machine has a file for it. */
+function alertToneAvailability() {
+  const out = {}
+  for (const key of ALERT_TONE_ORDER) out[key] = alertSound(key) !== null
+  return out
+}
+
+// The flash helper. One fixed script next to this module, no arguments, no
+// shell: a request can ask for the blink but cannot steer it, and a machine
+// without Windows simply reports that there is nothing to flash.
+/** Absolute path of the blink helper, or null where this module has no URL. */
+function flashScriptPath() {
+  try {
+    return path.join(path.dirname(fileURLToPath(import.meta.url)), 'tools', 'flash-taskbar.ps1')
+  } catch {
+    return null
+  }
+}
+const FLASH_MIN_GAP_MS = 1500
+const FLASH_KILL_MS = 15000
+let lastFlashAt = 0
+
+/** Start the taskbar blink; false when this platform or this moment cannot. */
+function flashTaskbar() {
+  if (process.platform !== 'win32') return false
+  const script = flashScriptPath()
+  if (script === null) return false
+  const now = Date.now()
+  if (now - lastFlashAt < FLASH_MIN_GAP_MS) return false
+  lastFlashAt = now
+  try {
+    const child = spawn('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', script,
+    ], { windowsHide: true, stdio: 'ignore', detached: false })
+    // The helper exits on its own; this is only a leash on a stuck one.
+    const timer = setTimeout(() => { try { child.kill() } catch { /* already gone */ } }, FLASH_KILL_MS)
+    if (typeof timer.unref === 'function') timer.unref()
+    child.on('error', () => {})
+    child.on('exit', () => clearTimeout(timer))
+    if (typeof child.unref === 'function') child.unref()
+    return true
+  } catch {
+    // no launcher here: the sound and the notification still land
+    return false
+  }
 }
 
 function sendJson(res, status, payload) {
@@ -558,6 +713,11 @@ export function apply(ctx, config) {
       period: PERIODS.has(askedPeriod) ? askedPeriod : 'today',
       cnyRate: cny,
       tool: unwrap(config.tool) !== false,
+      turnDoneAlert: clampNumber(unwrap(config.turnDoneAlert), 0, 0, 86400),
+      alertTone: alertToneKey(unwrap(config.alertTone)),
+      alertTones: alertToneAvailability(),
+      alertFlash: unwrap(config.alertFlash) !== false,
+      alertSound: alertSound(alertToneKey(unwrap(config.alertTone))) !== null,
       currency: cny > 0
         ? { code: 'CNY', symbol: '¥', rate: cny, base: 'USD' }
         : { code: 'USD', symbol: '$', rate: 1, base: 'USD' },
@@ -920,6 +1080,47 @@ export function apply(ctx, config) {
     }
   }
 
+  // The alert wav is a local file the browser cannot reach on its own, so the
+  // Host streams it under its own origin. Cached for a day: it never changes.
+  const alertHandler = async (req, res) => {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      res.setHeader('allow', 'GET, HEAD')
+      return sendJson(res, 405, { ok: false, error: 'GET only' })
+    }
+    const untrusted = isTrustedRequest(req)
+    if (untrusted !== null) return sendJson(res, 403, { ok: false, error: untrusted })
+    const wav = alertSound(alertToneParam(req, alertToneKey(unwrap(config.alertTone))))
+    if (wav === null) {
+      return sendJson(res, 404, {
+        ok: false,
+        code: 'no_sound',
+        error: 'no system notification sound here (point ' + ALERT_SOUND_ENV + ' at a .wav)',
+      })
+    }
+    res.statusCode = 200
+    res.setHeader('content-type', 'audio/wav')
+    res.setHeader('content-length', String(wav.bytes.length))
+    res.setHeader('cache-control', 'private, max-age=86400')
+    res.setHeader('x-content-type-options', 'nosniff')
+    res.end(req.method === 'HEAD' ? undefined : wav.bytes)
+  }
+
+  // The taskbar button belongs to the desktop shell, and the shell only
+  // paints it: no page can blink it. Windows' own answer is FlashWindowEx on
+  // the shell's window, which is what flashTaskbar() asks the helper to do.
+  const alertFlashHandler = async (req, res) => {
+    if (req.method !== 'POST') {
+      res.setHeader('allow', 'POST')
+      return sendJson(res, 405, { ok: false, error: 'POST only' })
+    }
+    const untrusted = isTrustedRequest(req)
+    if (untrusted !== null) return sendJson(res, 403, { ok: false, error: untrusted })
+    if (unwrap(config.alertFlash) === false) return sendJson(res, 200, { ok: true, flashed: false, code: 'off' })
+    const flashed = flashTaskbar()
+    const code = flashed ? 'flashed' : process.platform === 'win32' ? 'throttled' : 'unsupported'
+    sendJson(res, 200, { ok: true, flashed, code })
+  }
+
   // webServer only exists in profiles that serve the Web UI; stay inert in
   // headless/TUI profiles instead of failing activation.
   ctx.inject(['webServer'], (webCtx) => {
@@ -927,6 +1128,8 @@ export function apply(ctx, config) {
       { kind: 'exact', path: CONFIG_ROUTE, handler: configHandler },
       { kind: 'exact', path: DATA_ROUTE, handler: dataHandler },
       { kind: 'exact', path: SNAPSHOT_ROUTE, handler: snapshotHandler },
+      { kind: 'exact', path: ALERT_ROUTE, handler: alertHandler },
+      { kind: 'exact', path: ALERT_FLASH_ROUTE, handler: alertFlashHandler },
     ]
     webCtx.effect(() => {
       const disposers = routes.map((route) => {

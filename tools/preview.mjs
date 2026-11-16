@@ -164,18 +164,28 @@ async function loadHostApply() {
   const synthetic = (spec, value) => new vm.SyntheticModule(['default'], function () {
     this.setExport('default', value)
   }, { context, identifier: spec })
+  // Named exports, for the two modules the host imports by name.
+  const named = (spec, names) => new vm.SyntheticModule(Object.keys(names), function () {
+    for (const [key, value] of Object.entries(names)) this.setExport(key, value)
+  }, { context, identifier: spec })
   const fsShim = {
     readFileSync() {
       throw Object.assign(new Error('no gateway.json in preview'), { code: 'ENOENT' })
     },
   }
   const osShim = { homedir: () => '/nonexistent' }
-  const pathShim = { join: (...parts) => parts.join('/') }
+  const pathShim = {
+    join: (...parts) => parts.join('/'),
+    dirname: (value) => String(value).split('/').slice(0, -1).join('/'),
+  }
   await mod.link((spec) => {
     if (spec === '@deepseek-ai/schemastery') return synthetic(spec, z)
     if (spec === 'node:fs') return synthetic(spec, fsShim)
     if (spec === 'node:os') return synthetic(spec, osShim)
     if (spec === 'node:path') return synthetic(spec, pathShim)
+    // The alert's blink helper: the preview never blinks, it only has to mount.
+    if (spec === 'node:child_process') return named(spec, { spawn: () => ({ on() {}, kill() {}, unref() {} }) })
+    if (spec === 'node:url') return named(spec, { fileURLToPath: (value) => String(value) })
     throw new Error('preview cannot resolve ' + spec)
   })
   await mod.evaluate()
@@ -310,7 +320,32 @@ function runClient(seedSnap) {
   let dict = null
   let slotComponent = null
   const slots = {}
+  // The GUI serves the host config form; without it the settings page shows its
+  // "unavailable" fallback and two cards cannot be seen at all.
+  const previewConfig = {
+    gatewayUrl: 'http://127.0.0.1:3425',
+    refreshMs: 5000,
+    requestLimit: 40,
+    period: 'today',
+    cnyRate: 0,
+    discover: true,
+    tool: true,
+    turnDoneAlert: 180,
+    alertSound: true,
+    alertTone: 'alarm',
+    alertTones: { alarm: true, ring: true, bell: true, chime: true },
+    alertFlash: true,
+    currency: 'USD',
+  }
+  const previewConfigForm = {
+    getSnapshot: () => ({ status: 'ready', writable: true, value: { ...previewConfig } }),
+    subscribe: () => () => {},
+    set: () => Promise.resolve(),
+  }
+
   applied.apply({
+    inject(_names, cb) { if (typeof cb === 'function') cb(); return () => {} },
+    configForms: { get: () => previewConfigForm },
     effect(fn) { return fn() },
     locale: {
       register(ns, d) { dict = d; return () => {} },

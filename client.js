@@ -20,7 +20,7 @@ const NS = 'dsh-magpie-monitor'
 const WIDGET_ID = 'magpie-monitor'
 // Shown in the settings header so a stale browser bundle is obvious at a glance.
 // invariants.test.js keeps this equal to package.json.
-const VERSION = '1.6.11'
+const VERSION = '1.8.0'
 const API = '/magpie-monitor/api'
 const STORE_KEY = 'dsh-magpie-monitor:v1'
 const DISPLAY_KEY = 'dsh-magpie-monitor:display:v1'
@@ -172,6 +172,28 @@ const EN = {
   'settings.prefs.auto': 'Auto refresh',
   'settings.reset': 'Reset display settings',
   'settings.saved': 'Saved',
+  'settings.alerts': 'Alerts',
+  'settings.alerts.turnDone': 'Task done alert',
+  'settings.alerts.turnDone.hint': 'A notification when a task that ran at least this long finishes — the same rule as Magpie.',
+  'settings.alerts.off': 'Off',
+  'settings.alerts.custom': 'Custom threshold (seconds)',
+  'settings.alerts.test': 'Play the sound',
+  'settings.alerts.sound': 'Sound',
+  'settings.alerts.sound.alarm': 'Alarm',
+  'settings.alerts.sound.ring': 'Ring',
+  'settings.alerts.sound.bell': 'Bell',
+  'settings.alerts.sound.chime': 'Magpie chime',
+  'settings.alerts.flash': 'Flash the taskbar',
+  'settings.alerts.flash.hint': 'Blink the DSH taskbar button until this window comes back to the front.',
+  'settings.alerts.noSound': 'No system notification sound found on this machine.',
+  'settings.alerts.perm.ask': 'Allow notifications',
+  'settings.alerts.perm.granted': 'Desktop notifications are on',
+  'settings.alerts.perm.denied': 'Notifications are blocked in the system settings',
+  'settings.alerts.perm.unsupported': 'Notifications are not available here',
+  'alert.done.title': '{name} finished',
+  'alert.done.body': 'Ran for {time}',
+  'units.min': '{n}m',
+  'units.sec': '{n}s',
   'units.ms': 'ms',
   // relative age: the stale banner prints one of these
   'rel.now': 'just now',
@@ -326,6 +348,28 @@ const ZH = {
   'settings.prefs.auto': '自动刷新',
   'settings.reset': '重置展示设置',
   'settings.saved': '已保存',
+  'settings.alerts': '提醒',
+  'settings.alerts.turnDone': '任务完成提醒',
+  'settings.alerts.turnDone.hint': '一个至少跑了这么久的任务完成时提醒，规则与 Magpie 一致。',
+  'settings.alerts.off': '关',
+  'settings.alerts.custom': '自定义阈值（秒）',
+  'settings.alerts.test': '试听提示音',
+  'settings.alerts.sound': '提示音',
+  'settings.alerts.sound.alarm': '警报',
+  'settings.alerts.sound.ring': '铃声',
+  'settings.alerts.sound.bell': '钟声',
+  'settings.alerts.sound.chime': '系统通知音',
+  'settings.alerts.flash': '任务栏闪烁',
+  'settings.alerts.flash.hint': '闪烁 DSH 的任务栏按钮，直到窗口重新回到前台。',
+  'settings.alerts.noSound': '这台机器上没找到系统通知音。',
+  'settings.alerts.perm.ask': '允许通知',
+  'settings.alerts.perm.granted': '桌面通知已开启',
+  'settings.alerts.perm.denied': '系统设置里关掉了通知',
+  'settings.alerts.perm.unsupported': '这里用不了桌面通知',
+  'alert.done.title': '{name} 已完成',
+  'alert.done.body': '用时 {time}',
+  'units.min': '{n} 分钟',
+  'units.sec': '{n} 秒',
   'units.ms': '毫秒',
   'rel.now': '刚刚',
   'rel.m': '{n} 分钟前',
@@ -776,6 +820,211 @@ function createUiStore() {
 
 const uiStore = createUiStore()
 
+// ---- task done alert (Magpie's own turnDoneAlert) --------------------------
+//
+// Magpie's setting is a duration, not a switch: notify when a task that ran at
+// least this long finishes, and ring the Windows "Notification" sound with it.
+// The panel can see the same thing from the session list it already has — a
+// session whose row goes running -> idle is a task that just finished, and the
+// time we first saw it running is how long it took. Nothing here talks to the
+// gateway; the whole feature is local.
+
+const ALERT_KEY = 'dsh-magpie-monitor:alert:v1'
+// Magpie offers Off / 1 / 3 / 10 minutes; a typed value outside that is kept.
+const ALERT_PRESETS = [0, 60, 180, 600]
+const ALERT_MAX = 86400
+// The tones the Host can serve, in the order the card shows them.
+const ALERT_TONE_KEYS = ['alarm', 'ring', 'bell', 'chime']
+
+function sanitizeAlertSeconds(value) {
+  const n = Number(value)
+  if (!Number.isFinite(n) || n <= 0) return 0
+  return Math.min(Math.round(n), ALERT_MAX)
+}
+
+/** Sessions running right now: id -> when we first saw it running (ms). */
+function loadAlertStarts() {
+  const out = []
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return out
+    const raw = window.localStorage.getItem(ALERT_KEY)
+    if (!raw) return out
+    const env = JSON.parse(raw)
+    if (!env || env.v !== 1 || !env.starts || typeof env.starts !== 'object') return out
+    const now = Date.now()
+    for (const [id, at] of Object.entries(env.starts)) {
+      const began = Number(at)
+      // A stale entry or a clock jump must not ring an hour later.
+      if (typeof id === 'string' && id !== '' && Number.isFinite(began) && began > 0 && began <= now) out.push([id, began])
+    }
+  } catch {
+    return []
+  }
+  return out
+}
+
+function saveAlertStarts(starts) {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return
+    const plain = {}
+    for (const [id, at] of starts) plain[id] = at
+    window.localStorage.setItem(ALERT_KEY, JSON.stringify({ v: 1, starts: plain }))
+  } catch { /* storage full or gone — the watch still works in memory */ }
+}
+
+/** "3 分 20 秒" / "3m 20s", the shape Magpie's "{n} min" suggests. */
+function alertSpan(ms, t) {
+  const total = Math.max(0, Math.round(ms / 1000))
+  const min = Math.floor(total / 60)
+  const sec = total % 60
+  if (min === 0) return t('units.sec', { n: sec })
+  if (sec === 0) return t('units.min', { n: min })
+  return t('units.min', { n: min }) + ' ' + t('units.sec', { n: sec })
+}
+
+// The Host serves the wavs Windows ships, so the alert rings a real system
+// sound instead of an invented one. One element per tone, reused:
+// retriggering is a rewind, not a new load.
+let alertAudio
+let alertAudioTone = ''
+
+// Resolves true when the sound actually started and false when this machine has
+// none to play, so the settings card can say which it is instead of guessing.
+function playAlertSound(tone) {
+  const key = typeof tone === 'string' ? tone : ''
+  try {
+    if (typeof Audio === 'undefined') return Promise.resolve(false)
+    if (!alertAudio || alertAudioTone !== key) {
+      const query = key === '' ? '' : '?tone=' + encodeURIComponent(key)
+      alertAudio = new Audio(API + '/alert-sound' + query)
+      alertAudio.preload = 'auto'
+      alertAudio.volume = 1
+      alertAudioTone = key
+    }
+    try { alertAudio.currentTime = 0 } catch { /* not seekable before metadata */ }
+    const played = alertAudio.play()
+    if (played && typeof played.then === 'function') return played.then(() => true, () => false)
+    return Promise.resolve(true)
+  } catch {
+    // no audio element here; the notification still shows
+    return Promise.resolve(false)
+  }
+}
+
+function notifyPermission() {
+  try {
+    if (typeof Notification === 'undefined') return 'unsupported'
+    return Notification.permission || 'default'
+  } catch {
+    return 'unsupported'
+  }
+}
+
+function requestNotifyPermission() {
+  try {
+    if (typeof Notification === 'undefined' || typeof Notification.requestPermission !== 'function') {
+      return Promise.resolve('unsupported')
+    }
+    const asked = Notification.requestPermission()
+    return asked && typeof asked.then === 'function' ? asked : Promise.resolve('default')
+  } catch {
+    return Promise.resolve('unsupported')
+  }
+}
+
+/** Desktop notification; silent, because we play Magpie's wav ourselves. */
+function showDoneNotification(title, body) {
+  if (notifyPermission() !== 'granted') return false
+  try {
+    const note = new Notification(title, { body, silent: true, tag: 'magpie-monitor:done' })
+    setTimeout(() => { try { note.close() } catch { /* already gone */ } }, 8000)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Fallback when notifications are blocked: a card in the corner, then gone. */
+function showInlineAlert(title, body) {
+  try {
+    if (typeof document === 'undefined' || !document.body) return
+    const box = document.createElement('div')
+    box.className = 'mgp-alert-toast'
+    const head = document.createElement('div')
+    head.className = 'mgp-alert-toast-title'
+    head.textContent = title
+    const text = document.createElement('div')
+    text.className = 'mgp-alert-toast-body'
+    text.textContent = body
+    box.appendChild(head)
+    box.appendChild(text)
+    box.addEventListener('click', () => { try { box.remove() } catch { /* gone */ } })
+    document.body.appendChild(box)
+    setTimeout(() => { try { box.remove() } catch { /* gone */ } }, 6000)
+  } catch { /* no DOM — sound and notification carry it */ }
+}
+
+// The taskbar button belongs to the desktop shell, not to this page, so the
+// blink is one small POST: the Host owns the only call that reaches it.
+function flashTaskbar() {
+  try {
+    if (typeof fetch !== 'function') return Promise.resolve(false)
+    const asked = fetch(API + '/alert-flash', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    })
+    return asked.then((res) => !!(res && res.ok), () => false)
+  } catch {
+    return Promise.resolve(false)
+  }
+}
+
+/**
+ * Watches the client session list. Session rows carry `running`, so running ->
+ * idle is exactly "a task finished", and the first time we saw the row running
+ * is how long it ran. Kept as one function so the rule is readable: threshold
+ * comes from the host config, the timing survives a page reload.
+ */
+function watchTurnDone(ctx, readThreshold, onDone) {
+  const store = ctx && ctx.sessions && ctx.sessions.list
+  if (!store || typeof store.getSnapshot !== 'function' || typeof store.subscribe !== 'function') {
+    return () => {}
+  }
+  const starts = new Map(loadAlertStarts())
+  const sync = () => {
+    let snapshot
+    try { snapshot = store.getSnapshot() } catch { return }
+    const byId = (snapshot && snapshot.byId) || {}
+    const threshold = sanitizeAlertSeconds(readThreshold())
+    const now = Date.now()
+    let changed = false
+    for (const id of Object.keys(byId)) {
+      const row = byId[id]
+      if (!row || typeof row !== 'object') continue
+      // A subagent's turn belongs to the task that spawned it; the task itself
+      // ends when its own session goes idle.
+      if (row.parentId) continue
+      if (row.running) {
+        if (!starts.has(id)) { starts.set(id, now); changed = true }
+        continue
+      }
+      const began = starts.get(id)
+      if (began === undefined) continue
+      starts.delete(id)
+      changed = true
+      if (threshold <= 0) continue
+      const ran = now - began
+      if (ran >= threshold * 1000) onDone({ id, row, ran })
+    }
+    if (changed) saveAlertStarts(starts)
+  }
+  sync()
+  const off = store.subscribe(sync)
+  return () => { try { if (typeof off === 'function') off() } catch { /* already disposed */ } }
+}
+
+
 // ---- styles ---------------------------------------------------------------
 
 const css = [
@@ -953,6 +1202,13 @@ const css = [
   '.mgp-segbtn{appearance:none;border:none;background:transparent;color:var(--mgp-ink3);cursor:pointer;font-size:12px;min-height:20px;padding:0 7px;border-radius:999px;font-family:inherit;}',
   '.mgp-segbtn:hover{color:var(--mgp-ink2);}',
   '.mgp-segbtn-on{background:#33333a;color:var(--mgp-ink);font-weight:600;}',
+  // alerts card: a wrapped row of controls, and the corner card the panel uses
+  // when desktop notifications are blocked
+  '.mgp-alert-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}',
+  '.mgp-alert-seg{margin-left:0;flex-wrap:wrap;}',
+  '.mgp-alert-toast{position:fixed;right:16px;bottom:16px;z-index:9999;max-width:320px;padding:10px 12px;border:1px solid var(--mgp-line2,#3a3a41);border-radius:10px;background:var(--mgp-card,#232327);color:var(--mgp-ink,#ededf1);box-shadow:0 8px 24px rgba(0,0,0,.35);cursor:pointer;font-size:12px;line-height:1.45;}',
+  '.mgp-alert-toast-title{font-weight:600;margin-bottom:2px;}',
+  '.mgp-alert-toast-body{color:var(--mgp-ink2,#b9b9c1);}',
   '.mgp-mline{display:flex;align-items:center;gap:6px;font-size:12px;width:100%;min-width:0;padding:2px 0;}',
   '.mgp-mono{font-family:var(--ds-font-family-code,monospace);}',
   '.mgp-muted{color:var(--mgp-ink3);}',
@@ -2262,6 +2518,8 @@ window.__ModuleLoader__.load({
           const { state: cfgState, setField } = useConfigForm()
           const [previewExpanded, setPreviewExpanded] = React.useState(false)
           const [savedFlash, setSavedFlash] = React.useState(false)
+          const [perm, setPerm] = React.useState(() => notifyPermission())
+          const [soundOk, setSoundOk] = React.useState(null)
           const flashTimer = React.useRef(0)
           const cfg = (cfgState.status === 'ready' && cfgState.value) ? cfgState.value : null
           const writable = !!(cfg && cfgState.writable)
@@ -2295,6 +2553,8 @@ window.__ModuleLoader__.load({
           }
 
           const display = { style: ui.style, show: ui.show }
+          const alertSeconds = cfg ? sanitizeAlertSeconds(cfg.turnDoneAlert) : 0
+          const alertTone = cfg && typeof cfg.alertTone === 'string' ? cfg.alertTone : 'alarm'
 
           return h('div', { className: 'mgp-set' },
             h('style', null, css),
@@ -2361,6 +2621,49 @@ window.__ModuleLoader__.load({
                         h(Switch, { checked: cfg.tool !== false, disabled: !writable, label: t('settings.data.tool'), onChange: (v) => setField('tool', v).then(flashSaved) }),
                         !writable ? h('span', { className: 'mgp-field-hint' }, t('settings.data.readonly')) : null)),
                   ) : null),
+                // task done alert — Magpie's turnDoneAlert, same rule and same sound
+                cfg ? h('div', { className: 'mgp-set-card' },
+                  h('div', { className: 'mgp-set-cardtitle' }, t('settings.alerts')),
+                  h('div', { className: 'mgp-field-grid' },
+                    h(Field, { label: t('settings.alerts.turnDone'), hint: t('settings.alerts.turnDone.hint') },
+                      h('div', { className: 'mgp-alert-row' },
+                        h('div', { className: 'mgp-seg mgp-alert-seg', role: 'radiogroup', 'aria-label': t('settings.alerts.turnDone') },
+                          ALERT_PRESETS.map((sec) => h('button', {
+                            key: sec, type: 'button', role: 'radio', 'aria-checked': alertSeconds === sec,
+                            className: 'mgp-segbtn' + (alertSeconds === sec ? ' mgp-segbtn-on' : ''),
+                            disabled: !writable,
+                            onClick: () => { clearDraft('turnDoneAlert'); setField('turnDoneAlert', sec).then(flashSaved) },
+                          }, sec === 0 ? t('settings.alerts.off') : t('units.min', { n: sec / 60 })))))),
+                    h(Field, { label: t('settings.alerts.custom') },
+                      h(ConfigInput, { value: draftVal('turnDoneAlert'), type: 'number', min: 0, max: 86400, step: 30, disabled: !writable, onChange: editDraft('turnDoneAlert'), onBlur: () => commitNum('turnDoneAlert', 0, 86400), onEnter: () => commitNum('turnDoneAlert', 0, 86400) })),
+                    h(Field, { label: t('settings.alerts.sound') },
+                      h('div', { className: 'mgp-alert-row' },
+                        h('div', { className: 'mgp-seg mgp-alert-seg', role: 'radiogroup', 'aria-label': t('settings.alerts.sound') },
+                          ALERT_TONE_KEYS.map((key) => h('button', {
+                            key, type: 'button', role: 'radio', 'aria-checked': alertTone === key,
+                            className: 'mgp-segbtn' + (alertTone === key ? ' mgp-segbtn-on' : ''),
+                            disabled: !writable || (cfg.alertTones && cfg.alertTones[key] === false),
+                            onClick: () => {
+                              clearDraft('alertTone')
+                              setField('alertTone', key).then(() => {
+                                playAlertSound(key).then((ok) => { setSoundOk(ok); flashSaved() })
+                              })
+                            },
+                          }, t('settings.alerts.sound.' + key)))))),
+                    h(Field, { label: t('settings.alerts.flash'), hint: t('settings.alerts.flash.hint') },
+                      h('div', { className: 'mgp-field-inline' },
+                        h(Switch, { checked: cfg.alertFlash !== false, disabled: !writable, label: t('settings.alerts.flash'), onChange: (v) => setField('alertFlash', v).then(flashSaved) }),
+                        !writable ? h('span', { className: 'mgp-field-hint' }, t('settings.data.readonly')) : null)),
+                    soundOk === false ? h('div', { className: 'mgp-note' }, t('settings.alerts.noSound')) : null,
+                    h('div', { className: 'mgp-alert-row' },
+                      h('button', { type: 'button', className: 'mgp-btn', onClick: () => { playAlertSound(alertTone).then((ok) => { setSoundOk(ok); flashSaved() }) } }, t('settings.alerts.test')),
+                      perm === 'granted'
+                        ? h('span', { className: 'mgp-field-hint' }, t('settings.alerts.perm.granted'))
+                        : perm === 'denied'
+                          ? h('span', { className: 'mgp-field-hint' }, t('settings.alerts.perm.denied'))
+                          : perm === 'unsupported'
+                            ? h('span', { className: 'mgp-field-hint' }, t('settings.alerts.perm.unsupported'))
+                            : h('button', { type: 'button', className: 'mgp-btn', onClick: () => { requestNotifyPermission().then((p) => setPerm(p === 'granted' ? 'granted' : notifyPermission())) } }, t('settings.alerts.perm.ask'))))) : null,
                 // preferences + reset
                 h('div', { className: 'mgp-set-card' },
                   h('div', { className: 'mgp-set-cardtitle' }, t('settings.prefs')),
@@ -2389,6 +2692,42 @@ window.__ModuleLoader__.load({
 
         const settingsFallback = h('div', { className: 'mgp-set-fallback' }, 'Magpie settings unavailable')
         const MagpieSettingsSafe = (props) => h(SlotErrorBoundary, { fallback: settingsFallback }, h(MagpieSettings, props))
+
+        // task done alert: Magpie rings when a long task ends; so do we, with the
+        // same threshold rule and the same system sound.
+        const startAlertWatch = (sessionCtx) => {
+          const scope = sessionCtx || ctx
+          scope.effect(() => {
+            // Threshold, tone and flash all come from the same host config, so
+            // the panel never carries a second copy that could drift.
+            const readAlert = () => {
+              try {
+                const ctrl = ctx.configForms && typeof ctx.configForms.get === 'function' ? ctx.configForms.get(WIDGET_ID) : null
+                const snap = ctrl && typeof ctrl.getSnapshot === 'function' ? ctrl.getSnapshot() : null
+                const value = snap && snap.value ? snap.value : {}
+                return { seconds: value.turnDoneAlert, tone: value.alertTone, flash: value.alertFlash }
+              } catch {
+                return { seconds: 0, tone: undefined, flash: undefined }
+              }
+            }
+            return watchTurnDone(scope, () => readAlert().seconds, ({ row, ran }) => {
+              const alert = readAlert()
+              const name = row.displayTitle || row.title || row.id
+              const title = t('alert.done.title', { name })
+              const body = t('alert.done.body', { time: alertSpan(ran, t) })
+              playAlertSound(alert.tone)
+              // The blink is the shell's job; a Host that cannot start it
+              // changes nothing about the sound or the notification.
+              if (alert.flash !== false) flashTaskbar()
+              // One sound per turn: a granted notification is silent by design,
+              // the corner card carries the text when notifications are off.
+              if (!showDoneNotification(title, body)) showInlineAlert(title, body)
+            })
+          }, NS + ': task done alert')
+        }
+        // The service is optional, and the offline preview has no inject at all.
+        if (typeof ctx.inject === 'function') ctx.inject(['sessions'], startAlertWatch)
+        else startAlertWatch(ctx)
 
         // ---- registrations ----
         ctx.effect(() => ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({
