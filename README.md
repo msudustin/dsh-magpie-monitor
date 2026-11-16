@@ -10,7 +10,7 @@
 > matter, model speed and the harness → gateway → provider flight strip — in
 > one footer widget that stays out of the way.
 >
-> Package `@local/dsh-magpie-monitor` · v1.6.11 · MIT · Node.js >= 22 · read-only
+> Package `@local/dsh-magpie-monitor` · v1.8.0 · MIT · Node.js >= 22 · read-only
 
 <p align="center">
   <picture>
@@ -32,6 +32,7 @@ Rendered from the shipped <code>client.js</code> by <code>tools/preview.mjs</cod
 | **Quotas** | the most-used subscription windows as `provider · window … remaining %`, a 3 px track, `used / limit`, the reset countdown and the account |
 | **Speed & split** | per-model throughput as the gateway measured it, and how many calls went *through* the gateway, *direct* or were *reported* upstream |
 | **Display** | three styles (standard / compact / minimal), nine individual blocks, mask amounts and accounts, pause the refresh |
+| **Task done alert** | when a task that ran past your threshold finishes: a louder system sound of your choosing (alarm / ring / bell / chime) and the DSH taskbar button blinks until you come back — Magpie’s own rule, Magpie’s own sound |
 
 **Quick start**
 
@@ -156,13 +157,15 @@ default); the dashboard may be a few seconds ahead or scoped differently.
 ## Architecture
 
 The Magpie gateway (`http://127.0.0.1:3425` by default) sends no CORS headers,
-so the browser cannot call it directly. The host half registers three read-only
-routes on the DSH web server:
+so the browser cannot call it directly. The host half registers four read-only
+routes on the DSH web server plus the one effect the alert needs:
 
 | Route | Purpose |
 | --- | --- |
 | `GET /magpie-monitor/api/config` | Effective settings + resolved currency |
 | `GET /magpie-monitor/api/data?path=<key>` | Proxy one whitelisted upstream payload (`root`, `usage`, `requests`, `quotas`, `history`, `statusline`, `route`, `trace`, `models`) |
+| `GET /magpie-monitor/api/alert-sound[?tone=]` | The system wav for one alert tone (`alarm` / `ring` / `bell` / `chime`, default from config), served as `audio/wav` so the browser can play it |
+| `POST /magpie-monitor/api/alert-flash` | Blinks the DSH taskbar button (`FlashWindowEx` through one fixed PowerShell helper); `{flashed, code}` says whether it did |
 | `GET /magpie-monitor/api/snapshot?period&recent[&fresh=1]` | One merged, trimmed snapshot (health + usage + series + quotas + history + models + requests + speeds + channels + problems) so the client makes a single request per cycle |
 
 Query parameters are forwarded **per endpoint**, not from one flat allow-list:
@@ -215,9 +218,68 @@ the very next attempt.
 | `cnyRate` | `0` | USD→CNY rate; `0` keeps USD, `>0` converts every money figure once |
 | `discover` | `true` | Re-discover the gateway port from `~/.config/magpie/gateway.json` when the configured base refuses connections |
 | `tool` | `true` | Register the `magpie_usage` agent tool (read at apply; restart to change) |
+| `turnDoneAlert` | `0` | Ring when a task that ran at least this many seconds finishes; `0` is off. Same field, range and presets as the Magpie *Task done alert* (1 / 3 / 10 min, 0–86400 s) |
+| `alertTone` | `alarm` | Which system sound to ring: `alarm` (`Alarm01.wav`, 5.6 s), `ring` (`Ring05.wav`), `bell` (`Windows Notify Calendar.wav`) or `chime` (Magpie’s own `Notification.Default` wav, 1.3 s) |
+| `alertFlash` | `true` | Blink the DSH taskbar button when the alert fires; the sound plays either way |
 
 All keys are live-updatable (`.volatile()`); the host unwraps `{get()}`
 references before use.
+
+## Task done alert
+
+Magpie rings when a long agent task finishes. This plugin does the same, with
+Magpie's rule and Magpie's sound, so the two behave alike instead of each
+inventing a notification.
+
+- **The rule.** Magpie stores it as `turnDoneAlert`: a task that ran at least
+  that many seconds earns a notification, `0` turns the feature off, and its
+  settings offer 1, 3 and 10 minutes while still accepting any other value. The
+  host keeps the same field name and the same range (0–86400 s, `0` off), and the
+  settings card offers the same three presets plus a seconds field, so a value
+  copied from Magpie means the same thing here.
+- **What counts as a task.** A DSH session row going from `running` to idle in
+  the client `sessions` store. The widget watches `ctx.sessions.list` through
+  `ctx.inject(['sessions'], ...)`, so the plugin still mounts when that service is
+  absent, and it stamps the first cycle that sees a row running; on the flip it
+  compares the span with the threshold. Child sessions (`parentId`) are skipped —
+  the parent is the task that was actually running. A session already running
+  when the panel starts is timed from the first cycle it is seen, which is the
+  closest a browser-side observer can get to the turn's real start.
+- **The sound.** Magpie sends a Windows toast, and a toast plays the system
+  `Notification.Default` event sound — `Windows Notify System Generic.wav`,
+  1.3 s, and the quietest part of the notification set. `chime` keeps exactly
+  that (same file, same placement); the other three tones are louder and longer
+  system sounds, `alarm` by default because Magpie’s own chime is easy to miss.
+  Measured here (RMS / peak / length): `Windows Background` −23.4 dBFS / −9.2 /
+  1.29 s, `Alarm01` −24.5 / −9.2 / 5.57 s, `Notification.Default` −24.7 / −9.8 /
+  1.29 s, `Alarm02` −25.7 / −11.9 / 3.75 s, `Ring02` −29.3 / −10.3 / 3.56 s.
+  Volume alone was already near the ceiling, so the louder impression comes from
+  length and pattern, not gain.
+  Each tone lists its files in order (e.g. `alarm` is `Alarm01`, then `Alarm02`,
+  then `Alarm03`), and every tone falls back to the chime files, so a stripped
+  `Media` folder still rings something. The host reads each file once, checks
+  the `RIFF` header and the length, and caches it per tone in a `Map`; the route
+  takes `?tone=` from the allow-list only (anything else is the configured
+  tone) and caps the response at `max-age=86400`. Point
+  `MAGPIE_MONITOR_ALERT_WAV` at another wav to override every tone.
+- **The blink.** A browser cannot blink its own taskbar button, and the DSH
+  desktop shell exposes no window channel to a plugin page (its preload bridges
+  directories, paths and locale only, and the desktop host runs the harness in a
+  child process that the main process answers with `ready` alone). So the host
+  spawns `tools/flash-taskbar.ps1` once per alert: it walks up from `$PID` to
+  the first ancestor that owns a `MainWindowHandle` and calls `user32`
+  `FlashWindowEx` with `FLASHW_ALL | FLASHW_TIMERNOFG`, so the button flashes
+  until the window is focused. Nothing from the request reaches the argument
+  list, there is no shell, and `windowsHide` keeps a console from appearing;
+  the child is unref’d and killed after 15 s at the latest, and repeat alerts
+  inside 1.5 s are throttled to one blink. Off Windows the route answers
+  `{flashed: false, code: 'unsupported'}` and the sound is unaffected.
+
+- **The notification.** The client asks for browser notification permission once
+  and the settings card owns that button plus the state it is in. Granted, the
+  banner reads *`{session} finished` / `Ran for 3 minutes`* and is silent, so it
+  never rings the sound a second time; without permission the same line appears
+  as an in-page toast for six seconds. The sound plays either way.
 
 ## Agent tool
 
@@ -380,8 +442,14 @@ Both render the same `MagpieSettings` component:
 - **Live preview** — the right column renders the *same* `MagpieBody` presenter
   the footer uses, fed by a fixed `SAMPLE_SNAPSHOT`, so every style/toggle change
   is reflected immediately without a fetch or iframe.
+- **Alerts** — Magpie's *Task done alert* threshold (`off` / `1 min` / `3 min` /
+  `10 min`, or any number of seconds), the tone (`alarm` / `ring` / `bell` /
+  `chime`, each disabled when this machine lacks its wavs, and picking one
+  previews it), a *taskbar blink* switch, a button that plays the chosen sound on
+  demand, the browser notification permission with its request button, and an
+  inline note when a play attempt finds no sound on this machine.
 - **Host configuration** — `gatewayUrl`, `refreshMs`, `requestLimit`, `cnyRate`,
-  default `period`, `discover` and `tool` are edited through the client
+  default `period`, `turnDoneAlert`, `alertTone`, `alertFlash`, `discover` and `tool` are edited through the client
   `configForms` service (namespace `magpie-monitor`), persisted host-side via
   `remote.settings.mutate`. Numeric fields commit on blur/Enter and are clamped
   to the host ranges; if the namespace is not served the form degrades to a
@@ -438,6 +506,18 @@ by the DSH profile (it is a peer dependency, not a bundled one).
 - **No secrets** — the host reads one file (the gateway's own `gateway.json`
   report, for the port) and forwards no credentials; the client only ever calls
   same-origin routes.
+- **One fixed script, no arguments from outside** — the host spawns exactly one
+  thing: `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass
+  -WindowStyle Hidden -File <plugin>/tools/flash-taskbar.ps1`, with
+  `windowsHide`, no `shell`, and no value that came from a request. The
+  invariant test counts the `spawn(` call sites, requires the `.ps1` literal and
+  bans `shell: true` and `process.argv`. Everything else the alert needs is a
+  `readFileSync` of a known wav path with a `RIFF` check and a cached buffer,
+  behind the same same-machine gate as every other route.
+- **The alert never fails loudly and never fails silently** — no wav on this
+  machine answers `404 {code: 'no_sound'}` and the settings card says so on the
+  first play attempt; a blink that is switched off, throttled or unsupported
+  answers `200 {flashed: false, code}` so the client can keep the sound.
 - **Bounded detail reads** — `/api/data` aborts its upstream fetch when the panel
   closes the request, and refuses an endpoint that needs a parameter (`route`,
   `trace` need `session`) with a `400` instead of forwarding an empty query.
@@ -477,7 +557,7 @@ npm test
 
 (equivalently: `node --experimental-vm-modules --test --test-force-exit "test/*.test.js"`)
 
-91 tests: host integration (real `index.js` in a `vm` module with a stubbed
+98 tests: host integration (real `index.js` in a `vm` module with a stubbed
 schemastery, fake webServer/tools and mock fetch — including the same-machine
 gate, per-endpoint query rules, failure classification, port discovery and the
 "HTTP errors are not retried elsewhere" rule, in-flight read sharing, the
@@ -488,7 +568,13 @@ style selection, content toggles, reset, host config editing via a fake
 `configForms`, footer/settings shared state, the merged status control's
 live/paused/compact behaviour, speeds/channels readouts, translated problems,
 the failure backoff curve and the rail popup's open/Escape cycle), and
-source-level invariants (negative regexes for eval/innerHTML/external URLs/
+the task done alert (a three-minute task rings once with the configured tone and
+asks for one blink, a short one stays silent, a child session is skipped,
+`alertFlash: false` still rings, and `turnDoneAlert: 0` disables everything),
+the alert routes themselves (a tone picks its own wav, an unknown tone falls
+back to the configured one, the blink is POST-only behind the trust gate,
+spawns the helper with `windowsHide` and no shell, throttles a second call, and
+`alertFlash: false` answers `off` without spawning), source-level invariants (negative regexes for eval/innerHTML/external URLs/
 secrets, whitelist guards, single refresh affordance, 12px type floor, trust
 gate, failure-code contract, portal usage, manifest shape), and layout (the wire
 is rebuilt from the measured strip at 260/320/480 and from the measured marks
