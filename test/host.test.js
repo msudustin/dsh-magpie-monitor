@@ -159,21 +159,27 @@ function makeRes() {
   }
 }
 async function call(route, req) {
+  const raw = await callRaw(route, req)
+  return { status: raw.status, headers: raw.headers, json: JSON.parse(raw.body) }
+}
+async function callRaw(route, req) {
   const res = makeRes()
   await route.handler(req, res)
-  return { status: res.statusCode, headers: res.headers, json: JSON.parse(res.body) }
+  return { status: res.statusCode, headers: res.headers, body: res.body }
 }
 
 async function loadHost(config = {}, gatewayOpts = {}) {
   const gateway = makeGateway(gatewayOpts)
   const gatewayJson = gatewayOpts.gatewayJson ?? null
+  const wav = gatewayOpts.wav ?? null
   const fsReads = []
   const env = gatewayOpts.env ?? {}
+  const spawns = []
   const sandbox = {
-    console, URL, URLSearchParams, AbortController, AbortSignal,
+    console, URL, URLSearchParams, AbortController, AbortSignal, setTimeout, clearTimeout,
     Date, Math, JSON, Number, String, Object, Array, Promise, Set, Map, Error,
     encodeURIComponent, isNaN, fetch: gateway.fetchImpl,
-    process: { env },
+    process: { env, platform: gatewayOpts.platform ?? 'win32' },
   }
   const context = vm.createContext(sandbox)
   const mod = new vm.SourceTextModule(source, { context })
@@ -187,8 +193,10 @@ async function loadHost(config = {}, gatewayOpts = {}) {
         this.setExport('default', {
           readFileSync(file) {
             fsReads.push(String(file))
+            const name = String(file)
+            if (wav && /.wav$/i.test(name)) return wav
             if (gatewayJson === null) throw new Error('no gateway.json in tests')
-            if (!String(file).includes('gateway.json')) throw new Error('ENOENT: ' + file)
+            if (!name.includes('gateway.json')) throw new Error('ENOENT: ' + name)
             return JSON.stringify(gatewayJson)
           },
         })
@@ -199,7 +207,23 @@ async function loadHost(config = {}, gatewayOpts = {}) {
     }
     if (specifier === 'node:path') {
       return new vm.SyntheticModule(['default'], function () {
-        this.setExport('default', { join: (...parts) => parts.join('\\') })
+        this.setExport('default', {
+          join: (...parts) => parts.join('\\'),
+          dirname: (value) => String(value).split('\\').slice(0, -1).join('\\'),
+        })
+      }, { context })
+    }
+    if (specifier === 'node:child_process') {
+      return new vm.SyntheticModule(['spawn'], function () {
+        this.setExport('spawn', (command, args, options) => {
+          spawns.push({ command, args, options })
+          return { on() {}, kill() {}, unref() {} }
+        })
+      }, { context })
+    }
+    if (specifier === 'node:url') {
+      return new vm.SyntheticModule(['fileURLToPath'], function () {
+        this.setExport('fileURLToPath', (value) => String(value))
       }, { context })
     }
     throw new Error('unexpected import: ' + specifier)
@@ -207,9 +231,14 @@ async function loadHost(config = {}, gatewayOpts = {}) {
   await mod.evaluate()
   const fake = makeCtx()
   mod.namespace.apply(fake.ctx, config)
-  return { ...fake, gateway, config, fsReads }
+  return { ...fake, gateway, config, fsReads, spawns }
 }
 
+// A wav-shaped buffer with a real length: the Host ignores anything too short
+// to hold a header plus one sample.
+const fakeWav = () => Buffer.concat([Buffer.from('RIFF0000WAVEfmt '), Buffer.alloc(84)])
+
+const ALERT = '/magpie-monitor/api/alert-sound'
 const SNAP = '/magpie-monitor/api/snapshot'
 const DATA = '/magpie-monitor/api/data'
 const CONF = '/magpie-monitor/api/config'
@@ -429,7 +458,7 @@ test('tool=false skips registration', async () => {
 
 test('unloading disposes routes and tool', async () => {
   const h = await loadHost()
-  assert.equal(h.routes.size, 3)
+  assert.equal(h.routes.size, 5)
   assert.equal(h.tools.size, 1)
   for (const d of h.disposers) d()
   assert.equal(h.routes.size, 0)
@@ -576,6 +605,50 @@ test('a caller that leaves does not cancel a read another caller is sharing', as
   assert.equal(h.gateway.calls.filter((c) => c.path === '/v1/magpie/usage').length, 1)
 })
 
+test('the alert sound is the machine wav, served behind the same gate', async () => {
+  const wav = Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(60, 7)])
+  const h = await loadHost({}, { wav })
+  assert.ok(h.routes.has(ALERT), 'the route is registered')
+
+  const ok = await callRaw(h.routes.get(ALERT), makeReq(ALERT))
+  assert.equal(ok.status, 200)
+  assert.equal(ok.headers['content-type'], 'audio/wav')
+  assert.equal(ok.headers['content-length'], String(wav.length))
+  assert.equal(ok.body.equals(wav), true, 'the bytes are the wav itself')
+
+  const head = await callRaw(h.routes.get(ALERT), makeReq(ALERT, 'HEAD'))
+  assert.equal(head.status, 200)
+  assert.equal(head.body, undefined, 'HEAD answers headers only')
+
+  const foreign = await callRaw(h.routes.get(ALERT), makeReq(ALERT, 'GET', { host: 'evil.example.com' }))
+  assert.equal(foreign.status, 403, 'a foreign host never gets the file')
+
+  const posted = await callRaw(h.routes.get(ALERT), makeReq(ALERT, 'POST'))
+  assert.equal(posted.status, 405)
+})
+
+test('no wav on the machine is a named failure, not an empty sound', async () => {
+  const h = await loadHost({})
+  const res = await call(h.routes.get(ALERT), makeReq(ALERT))
+  assert.equal(res.status, 404)
+  assert.equal(res.json.code, 'no_sound')
+  // the settings page needs to know, so it can say so instead of ringing nothing
+  const conf = await call(h.routes.get(CONF), makeReq(CONF))
+  assert.equal(conf.json.config.alertSound, false)
+})
+
+test('the threshold travels through the config as Magpie states it', async () => {
+  const h = await loadHost({ turnDoneAlert: 180 })
+  const conf = await call(h.routes.get(CONF), makeReq(CONF))
+  assert.equal(conf.json.config.turnDoneAlert, 180)
+  const huge = await loadHost({ turnDoneAlert: 1e9 })
+  const clamped = await call(huge.routes.get(CONF), makeReq(CONF))
+  assert.equal(clamped.json.config.turnDoneAlert, 86400, 'one day is the ceiling')
+  const negative = await loadHost({ turnDoneAlert: -5 })
+  const off = await call(negative.routes.get(CONF), makeReq(CONF))
+  assert.equal(off.json.config.turnDoneAlert, 0, 'a negative value means off')
+})
+
 test('the detail read stops when the panel closes it', async () => {
   const h = await loadHost({}, { hang: { '/v1/magpie/quotas': true } })
   const req = makeReq(DATA + '?path=quotas')
@@ -607,5 +680,60 @@ test('gateway.json is read once per discovery window, not once per read', async 
   const route = h.routes.get(SNAP)
   await call(route, makeReq(SNAP + '?period=today'))
   await call(route, makeReq(SNAP + '?period=7d')) // a different period misses the snapshot cache
-  assert.equal(h.fsReads.length, 1, 'discovery must not put a synchronous disk read on every refresh')
+  // The alert wav is read once too, so count the discovery file itself.
+  assert.equal(h.fsReads.filter((file) => /gateway\.json$/.test(file)).length, 1,
+    'discovery must not put a synchronous disk read on every refresh')
+})
+
+test('a tone picks a louder system wav, behind the same gate', async () => {
+  const wav = fakeWav()
+  const h = await loadHost({ alertTone: 'alarm' }, { wav, gatewayJson: { url: 'http://127.0.0.1:3425' } })
+  const conf = await call(h.routes.get(CONF), makeReq(CONF))
+  assert.equal(conf.json.config.alertTone, 'alarm')
+  assert.deepEqual(conf.json.config.alertTones, { alarm: true, ring: true, bell: true, chime: true })
+  assert.equal(conf.json.config.alertFlash, true)
+
+  const ring = await callRaw(h.routes.get(ALERT), makeReq(ALERT + '?tone=ring'))
+  assert.equal(ring.status, 200)
+  assert.ok(h.fsReads.some((file) => /Ring05\.wav$/.test(file)), 'the ring tone reads its own wav')
+
+  // an unknown tone is the configured one, never an error
+  const unknown = await callRaw(h.routes.get(ALERT), makeReq(ALERT + '?tone=nope'))
+  assert.equal(unknown.status, 200)
+  assert.ok(h.fsReads.some((file) => /Alarm01\.wav$/.test(file)), 'it fell back to the configured alarm')
+})
+
+test('the flash route starts the one fixed helper, once per gap', async () => {
+  const h = await loadHost({}, { wav: fakeWav(), gatewayJson: { url: 'http://127.0.0.1:3425' } })
+  const FLASH = '/magpie-monitor/api/alert-flash'
+  assert.ok(h.routes.has(FLASH), 'the route is registered')
+
+  const get = await callRaw(h.routes.get(FLASH), makeReq(FLASH))
+  assert.equal(get.status, 405, 'the blink has an effect, so it is POST only')
+
+  const ok = await call(h.routes.get(FLASH), makeReq(FLASH, 'POST'))
+  assert.equal(ok.status, 200)
+  assert.equal(ok.json.flashed, true)
+  assert.equal(h.spawns.length, 1)
+  const [spawned] = h.spawns
+  assert.equal(spawned.command, 'powershell.exe')
+  assert.ok(spawned.args.includes('-File'))
+  assert.ok(/flash-taskbar\.ps1$/.test(spawned.args.at(-1)), 'the helper is the plugin\'s own script')
+  assert.equal(spawned.options.windowsHide, true)
+  assert.equal(spawned.options.shell, undefined, 'no shell, so nothing is interpolated')
+
+  const again = await call(h.routes.get(FLASH), makeReq(FLASH, 'POST'))
+  assert.equal(again.json.code, 'throttled')
+  assert.equal(h.spawns.length, 1, 'one blink per gap')
+
+  const foreign = await callRaw(h.routes.get(FLASH), makeReq(FLASH, 'POST', { host: 'evil.example.com' }))
+  assert.equal(foreign.status, 403)
+})
+
+test('alertFlash=false keeps the ring and drops the blink', async () => {
+  const h = await loadHost({ alertFlash: false }, { wav: fakeWav(), gatewayJson: { url: 'http://127.0.0.1:3425' } })
+  const FLASH = '/magpie-monitor/api/alert-flash'
+  const res = await call(h.routes.get(FLASH), makeReq(FLASH, 'POST'))
+  assert.deepEqual(res.json, { ok: true, flashed: false, code: 'off' })
+  assert.equal(h.spawns.length, 0, 'the sound is untouched by this switch')
 })

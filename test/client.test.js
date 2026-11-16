@@ -255,7 +255,9 @@ function makeEnv(opts = {}) {
   }
   const sandbox = {
     window, document, console, fetch: mockFetch,
-    AbortController, AbortSignal, Intl, Date, Math, JSON, Number, String, Object, Array, Boolean, Promise, Set, Map, Error, RegExp,
+    AbortController, AbortSignal, Intl, Date: opts.Date || Date, Math, JSON, Number, String, Object, Array, Boolean, Promise, Set, Map, Error, RegExp,
+    // The alert path only exists when the shell provides these; undefined is what a bare realm looks like.
+    Notification: opts.Notification, Audio: opts.Audio,
     encodeURIComponent, decodeURIComponent, isNaN,
     setTimeout: (fn, ms) => { const id = setTimeout(fn, ms); timers.timeouts.add(id); return id },
     clearTimeout: (id) => { timers.timeouts.delete(id); clearTimeout(id) },
@@ -275,12 +277,15 @@ function makeEnv(opts = {}) {
   return env
 }
 
-function makeClientCtx(env) {
+function makeClientCtx(env, extra = {}) {
   const dicts = {}
   const registrations = []
   const effects = []
   let lang = 'zh'
   const ctx = {
+    // cordis injects a child scope; the fake only needs the callback to run so
+    // optional services can be present or absent per test.
+    inject(names, cb) { cb(); return () => {} },
     effect(fn, label) { const cleanup = fn(); effects.push({ label, cleanup }); return cleanup },
     locale: {
       register(ns, d) { dicts[ns] = d; return () => { delete dicts[ns] } },
@@ -297,6 +302,7 @@ function makeClientCtx(env) {
       inject(name, cb) { cb(); return () => {} },
       register(descriptor, Component) { const entry = { descriptor, Component }; registrations.push(entry); return () => {} },
     },
+    ...extra,
   }
   return { ctx, dicts, registrations, effects, setLang: (l) => { lang = l } }
 }
@@ -304,7 +310,7 @@ function makeClientCtx(env) {
 function setup(opts = {}) {
   const env = makeEnv(opts)
   const plugin = env.captured.factory((name) => { if (name === 'react') return env.React; throw new Error('unexpected require ' + name) })
-  const c = makeClientCtx(env)
+  const c = makeClientCtx(env, opts.ctx || {})
   plugin.apply(c.ctx)
   return { env, plugin, ...c }
 }
@@ -1222,4 +1228,84 @@ test('the panel defines its own width and never styles the host around it', asyn
   assert.doesNotMatch(css, /wtg9ga/, 'and neither are the sidebar plugin classes')
   assert.match(css, /\.mgp-footstack\.rail\s*\{[^}]*width:\s*auto/, 'the rail collapses back to the icon')
   m.unmount(); s.env.dispose()
+})
+
+// ---- task done alert (Magpie's turnDoneAlert) -------------------------------
+// The setting is a duration, so what the panel must get right is the edge:
+// running -> idle after at least that long. One clock, one fake session list.
+test('a task past the magpie threshold rings once with the system sound', async () => {
+  const clock = { now: 1760000000000 }
+  class FakeDate extends Date {
+    constructor(...args) { if (args.length === 0) super(clock.now); else super(...args) }
+    static now() { return clock.now }
+  }
+  const notes = []
+  class FakeNotification {
+    static permission = 'granted'
+    constructor(title, opts) { notes.push({ title, body: opts.body, silent: opts.silent }) }
+    close() {}
+  }
+  const played = []
+  class FakeAudio {
+    constructor(src) { this.src = src; this.preload = ''; this.volume = 1; this.currentTime = 0 }
+    play() { played.push(this.src); return Promise.resolve() }
+  }
+  const store = {
+    snap: { ids: [], byId: {}, phase: 'ready' },
+    listeners: new Set(),
+    getSnapshot() { return this.snap },
+    subscribe(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn) },
+    publish(byId) { this.snap = { ids: Object.keys(byId), byId, phase: 'ready' }; for (const fn of [...this.listeners]) fn() },
+  }
+  const cfg = { turnDoneAlert: 60, alertTone: 'ring', alertFlash: true }
+  const s = setup({
+    Date: FakeDate, Notification: FakeNotification, Audio: FakeAudio,
+    ctx: {
+      sessions: { list: store },
+      configForms: { get: () => ({ getSnapshot: () => ({ status: 'ready', value: { ...cfg }, writable: true }) }) },
+    },
+  })
+
+  // a task runs for three minutes, then the session goes idle
+  store.publish({ s1: { id: 's1', displayTitle: 'refactor the runner', running: true } })
+  clock.now += 3 * 60 * 1000
+  store.publish({ s1: { id: 's1', displayTitle: 'refactor the runner', running: false } })
+  assert.equal(played.length, 1, 'the sound plays once')
+  assert.ok(played[0].includes('/magpie-monitor/api/alert-sound'), 'it is the host-served system wav')
+  assert.ok(played[0].includes('tone=ring'), 'the configured tone, not the stock chime')
+  const flashes = s.env.fetchCalls.filter((call) => call.url.includes('/alert-flash'))
+  assert.equal(flashes.length, 1, 'the taskbar blink is asked for once per turn')
+  assert.equal(flashes[0].init.method, 'POST')
+  assert.equal(notes.length, 1, 'one notification')
+  assert.match(notes[0].title, /refactor the runner/)
+  assert.match(notes[0].body, /3/)
+  assert.equal(notes[0].silent, true, 'silent: the wav is played by the panel')
+
+  // a short turn is a normal turn: nothing rings
+  store.publish({ s1: { id: 's1', displayTitle: 'typo', running: true } })
+  clock.now += 5 * 1000
+  store.publish({ s1: { id: 's1', displayTitle: 'typo', running: false } })
+  assert.equal(notes.length, 1, 'below the threshold stays quiet')
+
+  // a subagent's turn belongs to the task that spawned it
+  store.publish({ s2: { id: 's2', displayTitle: 'child', running: true, parentId: 's1' } })
+  clock.now += 10 * 60 * 1000
+  store.publish({ s2: { id: 's2', displayTitle: 'child', running: false, parentId: 's1' } })
+  assert.equal(notes.length, 1, 'subagent turns are the parent task')
+
+  // the blink is a separate switch from the ring
+  cfg.alertFlash = false
+  store.publish({ s4: { id: 's4', displayTitle: 'no blink', running: true } })
+  clock.now += 10 * 60 * 1000
+  store.publish({ s4: { id: 's4', displayTitle: 'no blink', running: false } })
+  assert.equal(played.length, 2, 'still rings')
+  assert.equal(s.env.fetchCalls.filter((call) => call.url.includes('/alert-flash')).length, 1, 'but does not blink')
+
+  // 0 is Magpie's "Off"
+  cfg.turnDoneAlert = 0
+  store.publish({ s3: { id: 's3', displayTitle: 'quiet', running: true } })
+  clock.now += 10 * 60 * 1000
+  store.publish({ s3: { id: 's3', displayTitle: 'quiet', running: false } })
+  assert.equal(notes.length, 2, 'off means off')
+  assert.equal(played.length, 2, 'and silent')
 })

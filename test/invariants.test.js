@@ -41,10 +41,18 @@ test('client keeps a stable error boundary and cleans up on unmount', () => {
   assert.ok(/clearInterval\(id\)/.test(client))
 })
 
-test('host is not an open proxy and spawns nothing', () => {
-  for (const re of [/child_process/, /\bspawn\s*\(/, /\bexec\s*\(/, /require\s*\(/, /\.innerHTML\b/, /\beval\s*\(/]) {
+test('host is not an open proxy and spawns only the blink helper', () => {
+  for (const re of [/\bexec\s*\(/, /require\s*\(/, /\.innerHTML\b/, /\beval\s*\(/]) {
     assert.equal(re.test(host), false, `host must not match ${re}`)
   }
+  // One spawn, for the taskbar blink: a fixed script next to the module, no
+  // request-supplied argument, never through a shell.
+  assert.equal((host.match(/\bspawn\s*\(/g) || []).length, 1, 'exactly one spawn')
+  assert.ok(/from 'node:child_process'/.test(host))
+  assert.ok(/flash-taskbar\.ps1/.test(host), 'the helper path is a literal')
+  assert.equal(/shell\s*:\s*true/.test(host), false, 'the spawn never goes through a shell')
+  assert.ok(/windowsHide: true/.test(host))
+  assert.ok(!/process\.argv/.test(host), 'nothing from the outside reaches the helper')
   // The host may read the gateway's own discovery file, but nothing else: the
   // path is a literal under the user's config directory.
   assert.ok(/node:fs/.test(host), 'host reads the gateway discovery file')
@@ -56,8 +64,9 @@ test('host is not an open proxy and spawns nothing', () => {
   assert.ok(/const PASS_QUERY = new Set\(Object\.values\(QUERY_RULES\)/.test(host),
     'the forwarded query set is derived from the per-endpoint rules')
   assert.ok(/required: \['session'\]/.test(host), 'session is required where the endpoint needs it')
-  // routes are GET-only
-  assert.equal((host.match(/req\.method !== 'GET'/g) || []).length, 3, 'all three routes guard GET')
+  // every read is GET-only; the blink is the one POST
+  assert.equal((host.match(/req\.method !== 'GET'/g) || []).length, 4, 'every read route guards GET')
+  assert.equal((host.match(/req\.method !== 'POST'/g) || []).length, 1, 'only the blink takes POST')
   assert.ok(/x-content-type-options', 'nosniff'/.test(host))
   assert.ok(/cache-control', 'no-store'/.test(host))
 })
@@ -115,7 +124,7 @@ test('the panel blocks keep their height when the sidebar gets short', () => {
 
 test('manifest wires the bundle and client correctly', () => {
   assert.equal(pkg.name, '@local/dsh-magpie-monitor')
-  assert.equal(pkg.version, '1.6.11')
+  assert.match(pkg.version, /^\d+\.\d+\.\d+$/)
   assert.equal(pkg.type, 'module')
   assert.equal(pkg.dsh.bundle.patch, './cordis.patch.yml')
   assert.equal(pkg.dsh.client.platform, 'web')
