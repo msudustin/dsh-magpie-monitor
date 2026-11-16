@@ -14,7 +14,7 @@
 
 <p align="center">
   <picture>
-    <img src="docs/sidebar.png" width="352" alt="dsh-magpie-monitor in the DSH sidebar: flight strip DSH to magpie to Qoder, the latest route with model and status, today's calls / tokens / cost, derived metrics, hourly bars and two quota windows">
+    <img src="docs/sidebar.png" width="400" alt="dsh-magpie-monitor in the DSH sidebar: flight strip DSH to magpie to Qoder, the latest route with model and status, today's calls / tokens / cost, derived metrics, hourly bars and two quota windows">
   </picture>
 </p>
 
