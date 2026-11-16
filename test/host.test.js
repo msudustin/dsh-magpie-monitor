@@ -60,7 +60,7 @@ const requestsFixture = {
   rows: [
     { route_id: 'r1', t: '2026-11-15T12:00:00+08:00', agent: 'qw', agentName: 'QwenWork', provider: 'zcode', providerName: 'ZCode', providerAccount: 'acct', model: 'glm-5.3', req: 'group/x', served: 'glm-5.3', in: 10, out: 20, cache_read: 30, reasoning: 5, ms: 1234, ttft_ms: 456, status: 200, cost: 0.01, priced: true, ep: 'e', access: 'a', session: 's' },
     { route_id: 'r2', t: '2026-11-15T11:00:00+08:00', agent: 'cc', provider: 'zcode', model: 'glm-5.3', req: 'group/y', in: 1, out: 2, cache_read: 0, ms: 900, ttft_ms: 300, status: 200, cost: 0.02 },
-    { route_id: 'r3', t: '2026-11-15T10:00:00+08:00', agent: 'cc', provider: 'p', model: 'frontier-1', req: 'group/z', served: 'frontier-1', in: 1, out: 2, ms: 500, status: 200, cost: 0, priced: false },
+    { route_id: 'r3', t: 1763173200000, agent: 'cc', provider: 'p', model: 'frontier-1', req: 'group/z', served: 'frontier-1', in: 1, out: 2, ms: 500, status: 200, cost: 0, priced: false },
   ],
 }
 
@@ -68,17 +68,38 @@ function makeGateway(opts = {}) {
   const calls = []
   const fail = opts.fail || {}
   const hang = opts.hang || {}
+  // Ports that refuse every call, so a discovery retry can be observed.
+  const deadPorts = new Set(opts.deadPorts || [])
   const fetchImpl = (url, init) => {
     const u = String(url)
     const parsed = new URL(u)
     const p = parsed.pathname
     calls.push({ url: u, path: p, query: parsed.searchParams, init })
+    if (deadPorts.has(parsed.port)) {
+      const err = new Error('connect ECONNREFUSED ' + parsed.host)
+      err.name = 'TypeError'
+      err.cause = Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' })
+      return Promise.reject(err)
+    }
     if (hang[p]) {
       return new Promise((resolve, reject) => {
         init.signal.addEventListener('abort', () => reject(new Error('aborted')))
       })
     }
-    if (fail[p]) return Promise.reject(new Error(fail[p]))
+    if (fail[p]) {
+      const err = new Error(fail[p])
+      if (fail[p].startsWith('ECONNREFUSED')) err.name = 'TypeError'
+      return Promise.reject(err)
+    }
+    const failStatus = opts.failStatus || {}
+    if (failStatus[p] !== undefined) {
+      const status = failStatus[p]
+      return Promise.resolve({
+        ok: false, status,
+        json: async () => ({ error: { message: 'boom' } }),
+        text: async () => JSON.stringify({ error: { message: 'boom' } }),
+      })
+    }
     let body
     if (p === '/') body = rootFixture
     else if (p === '/v1/magpie/usage') body = usageFixture(parsed.searchParams.get('period') || '30d')
@@ -86,10 +107,16 @@ function makeGateway(opts = {}) {
     else if (p === '/v1/magpie/quotas/history') body = historyFixture
     else if (p === '/v1/magpie/statusline') body = 'magpie · ok'
     else if (p === '/v1/magpie/usage/requests') body = requestsFixture
+    else if (p === '/v1/magpie/route') body = { route: { id: 'r', status: 200 }, seq: 1, session: parsed.searchParams.get('session') }
     else if (p === '/v1/models') body = { data: [] }
     else return Promise.resolve({ ok: false, status: 404, json: async () => ({}), text: async () => 'not found' })
     const isText = p === '/v1/magpie/statusline'
-    return Promise.resolve({ ok: true, status: 200, json: async () => body, text: async () => (isText ? body : JSON.stringify(body)) })
+    const payload = { ok: true, status: 200, json: async () => body, text: async () => (isText ? body : JSON.stringify(body)) }
+    // A small delay keeps a read visibly in flight, which is when sharing and
+    // cancellation actually happen.
+    const wait = (opts.delay || {})[p]
+    if (wait) return new Promise((resolve) => setTimeout(() => resolve(payload), wait))
+    return Promise.resolve(payload)
   }
   return { fetchImpl, calls }
 }
@@ -114,10 +141,12 @@ function makeCtx() {
   return { ctx, routes, tools, disposers, warnings }
 }
 
-function makeReq(url, method = 'GET') {
+function makeReq(url, method = 'GET', headers = {}) {
   const listeners = {}
   return {
     method, url,
+    // A same-origin request from the harness page looks like this.
+    headers: { host: '127.0.0.1:12097', origin: 'http://127.0.0.1:12097', ...headers },
     on(evt, cb) { (listeners[evt] ||= []).push(cb); return this },
     emit(evt) { for (const cb of listeners[evt] || []) cb() },
   }
@@ -137,10 +166,14 @@ async function call(route, req) {
 
 async function loadHost(config = {}, gatewayOpts = {}) {
   const gateway = makeGateway(gatewayOpts)
+  const gatewayJson = gatewayOpts.gatewayJson ?? null
+  const fsReads = []
+  const env = gatewayOpts.env ?? {}
   const sandbox = {
     console, URL, URLSearchParams, AbortController, AbortSignal,
     Date, Math, JSON, Number, String, Object, Array, Promise, Set, Map, Error,
     encodeURIComponent, isNaN, fetch: gateway.fetchImpl,
+    process: { env },
   }
   const context = vm.createContext(sandbox)
   const mod = new vm.SourceTextModule(source, { context })
@@ -149,12 +182,32 @@ async function loadHost(config = {}, gatewayOpts = {}) {
     if (specifier === '@deepseek-ai/schemastery') {
       return new vm.SyntheticModule(['default'], function () { this.setExport('default', z) }, { context })
     }
+    if (specifier === 'node:fs') {
+      return new vm.SyntheticModule(['default'], function () {
+        this.setExport('default', {
+          readFileSync(file) {
+            fsReads.push(String(file))
+            if (gatewayJson === null) throw new Error('no gateway.json in tests')
+            if (!String(file).includes('gateway.json')) throw new Error('ENOENT: ' + file)
+            return JSON.stringify(gatewayJson)
+          },
+        })
+      }, { context })
+    }
+    if (specifier === 'node:os') {
+      return new vm.SyntheticModule(['default'], function () { this.setExport('default', { homedir: () => 'C:\\test' }) }, { context })
+    }
+    if (specifier === 'node:path') {
+      return new vm.SyntheticModule(['default'], function () {
+        this.setExport('default', { join: (...parts) => parts.join('\\') })
+      }, { context })
+    }
     throw new Error('unexpected import: ' + specifier)
   })
   await mod.evaluate()
   const fake = makeCtx()
   mod.namespace.apply(fake.ctx, config)
-  return { ...fake, gateway, config }
+  return { ...fake, gateway, config, fsReads }
 }
 
 const SNAP = '/magpie-monitor/api/snapshot'
@@ -208,12 +261,25 @@ test('data route whitelists path keys and forwards only allowed query', async ()
   assert.equal(ok.json.data.calls, 829)
   const call0 = h.gateway.calls.at(-1)
   assert.equal(call0.query.get('period'), '7d')
-  assert.equal(call0.query.get('limit'), '3')
+  // `limit` belongs to /usage/requests, not /usage: per-endpoint rules keep it out.
+  assert.equal(call0.query.get('limit'), null)
   assert.equal(call0.query.get('evil'), null)
+  const requests = await call(h.routes.get(DATA), makeReq(DATA + '?path=requests&limit=3&offset=2'))
+  assert.equal(requests.status, 200)
+  const call1 = h.gateway.calls.at(-1)
+  assert.equal(call1.query.get('limit'), '3')
+  assert.equal(call1.query.get('offset'), '2')
   const unknown = await call(h.routes.get(DATA), makeReq(DATA + '?path=../../etc'))
   assert.equal(unknown.status, 400)
   const post = await call(h.routes.get(DATA), makeReq(DATA + '?path=usage', 'POST'))
   assert.equal(post.status, 405)
+  // /route needs a session id: refuse it locally instead of asking the gateway.
+  const noSession = await call(h.routes.get(DATA), makeReq(DATA + '?path=route'))
+  assert.equal(noSession.status, 400)
+  assert.match(noSession.json.error, /missing required query: session/)
+  const withSession = await call(h.routes.get(DATA), makeReq(DATA + '?path=route&session=abc'))
+  assert.equal(withSession.status, 200)
+  assert.equal(h.gateway.calls.at(-1).query.get('session'), 'abc')
 })
 
 test('snapshot merges, trims and derives metrics', async () => {
@@ -240,6 +306,18 @@ test('snapshot merges, trims and derives metrics', async () => {
   assert.equal(b.statusline, 'magpie · ok')
   assert.deepEqual(b.problems, [])
   assert.ok(b.config && b.currency)
+})
+
+test('a request stamp survives whichever shape the gateway sends', async () => {
+  const h = await loadHost()
+  const r = await call(h.routes.get(SNAP), makeReq(SNAP))
+  const b = r.json
+  // the endpoint sends ISO text; its own request table sends epoch milliseconds.
+  // Either way the client must receive something it can parse, or the row time,
+  // the freshness dot and the flight strip all go dead.
+  assert.equal(b.requests[0].t, '2026-11-15T12:00:00+08:00')
+  assert.match(b.requests[2].t, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/)
+  assert.equal(Date.parse(b.requests[2].t), 1763173200000)
 })
 
 test('cnyRate converts every cost at one point', async () => {
@@ -275,13 +353,25 @@ test('recent defaults to requestLimit, not 1 (null clamp regression)', async () 
   assert.equal((await call(h2.routes.get(SNAP), makeReq(SNAP + '?recent=2&fresh=1'))).json.requests.length, 2)
 })
 
+test('the requests read is scoped to the selected period', async () => {
+  // /usage/requests measures speeds and channels per window; asking without a
+  // period silently widens them to the gateway's default window.
+  const h = await loadHost()
+  await call(h.routes.get(SNAP), makeReq(SNAP + '?period=7d'))
+  const reqCall = h.gateway.calls.find((c) => c.path === '/v1/magpie/usage/requests')
+  assert.equal(reqCall.query.get('period'), '7d')
+  const usageCall = h.gateway.calls.find((c) => c.path === '/v1/magpie/usage')
+  assert.equal(usageCall.query.get('period'), '7d')
+})
+
 test('optional endpoint failure becomes a problem, usage survives', async () => {
   const h = await loadHost({}, { fail: { '/v1/magpie/quotas': 'provider timeout' } })
   const r = await call(h.routes.get(SNAP), makeReq(SNAP))
   assert.equal(r.status, 200)
   assert.deepEqual(r.json.quotas, [])
   assert.equal(r.json.usage.calls, 829)
-  assert.ok(r.json.problems.some((p) => p.startsWith('额度读取失败')))
+  assert.ok(r.json.problems.some((p) => p.what === '额度' && typeof p.message === 'string' && p.message.length > 0),
+    'the failed endpoint is reported with a structured problem')
 })
 
 test('required usage failure returns 502', async () => {
@@ -344,4 +434,178 @@ test('unloading disposes routes and tool', async () => {
   for (const d of h.disposers) d()
   assert.equal(h.routes.size, 0)
   assert.equal(h.tools.size, 0)
+})
+
+// ---------------------------------------------------------------------------
+// v1.4: request trust, gateway discovery, failure classification
+// ---------------------------------------------------------------------------
+
+test('routes refuse a request that is not same-machine', async () => {
+  const h = await loadHost()
+  const foreign = await call(h.routes.get(SNAP), makeReq(SNAP, 'GET', { host: 'evil.example.com' }))
+  assert.equal(foreign.status, 403)
+  assert.match(foreign.json.error, /unexpected host/)
+
+  const crossSite = await call(h.routes.get(SNAP), makeReq(SNAP, 'GET', { 'sec-fetch-site': 'cross-site' }))
+  assert.equal(crossSite.status, 403)
+  assert.match(crossSite.json.error, /cross-site/)
+
+  const mismatch = await call(h.routes.get(SNAP), makeReq(SNAP, 'GET', { origin: 'http://evil.example.com' }))
+  assert.equal(mismatch.status, 403)
+  assert.match(mismatch.json.error, /origin mismatch/)
+
+  // A refusal must happen before any network call.
+  assert.equal(h.gateway.calls.length, 0)
+
+  for (const route of [CONF, DATA]) {
+    const r = await call(h.routes.get(route), makeReq(route, 'GET', { host: 'evil.example.com' }))
+    assert.equal(r.status, 403)
+  }
+  assert.equal(h.gateway.calls.length, 0)
+})
+
+test('a same-origin request without an Origin header is allowed', async () => {
+  const h = await loadHost()
+  const r = await call(h.routes.get(SNAP), makeReq(SNAP, 'GET', { origin: undefined }))
+  assert.equal(r.status, 200)
+})
+
+test('snapshot reports a classified failure instead of a raw stack', async () => {
+  const h = await loadHost({}, { fail: { '/v1/magpie/usage': 'ECONNREFUSED 127.0.0.1:3425' } })
+  const r = await call(h.routes.get(SNAP), makeReq(SNAP))
+  assert.equal(r.status, 502)
+  assert.equal(r.json.ok, false)
+  assert.equal(r.json.code, 'connection')
+  assert.match(r.json.error, /连不上 Magpie 网关/)
+})
+
+test('a timeout is classified separately from a refused connection', async () => {
+  const h = await loadHost({}, { fail: { '/v1/magpie/usage': 'The operation timed out' } })
+  const r = await call(h.routes.get(SNAP), makeReq(SNAP))
+  assert.equal(r.status, 502)
+  assert.equal(r.json.code, 'timeout')
+})
+
+test('discovery finds a moved gateway port and remembers it', async () => {
+  // The configured URL refuses; gateway.json points at 4599, which answers.
+  const h = await loadHost(
+    { gatewayUrl: 'http://127.0.0.1:3425' },
+    { deadPorts: ['3425'], gatewayJson: { addr: '127.0.0.1:4599', pid: 1, version: '0.1.0' } },
+  )
+  const r = await call(h.routes.get(SNAP), makeReq(SNAP))
+  assert.equal(r.status, 200)
+  assert.equal(r.json.gateway, 'http://127.0.0.1:4599')
+  assert.equal(r.json.usage.calls, 829)
+  // The dead port was tried first, then the discovered one.
+  assert.ok(h.gateway.calls.some((c) => c.url.includes(':3425')))
+  assert.ok(h.gateway.calls.some((c) => c.url.includes(':4599')))
+})
+
+test('the env variable wins over gateway.json', async () => {
+  const h = await loadHost(
+    { gatewayUrl: 'http://127.0.0.1:3425' },
+    {
+      deadPorts: ['3425', '4599'],
+      env: { MAGPIE_URL: 'http://127.0.0.1:7777' },
+      gatewayJson: { addr: '127.0.0.1:4599' },
+    },
+  )
+  const r = await call(h.routes.get(SNAP), makeReq(SNAP))
+  assert.equal(r.status, 200)
+  assert.equal(r.json.gateway, 'http://127.0.0.1:7777')
+})
+
+test('discover=false keeps the configured URL as the only candidate', async () => {
+  const h = await loadHost(
+    { discover: false },
+    { deadPorts: ['3425'], gatewayJson: { addr: '127.0.0.1:4599' } },
+  )
+  const r = await call(h.routes.get(SNAP), makeReq(SNAP))
+  assert.equal(r.status, 502)
+  assert.equal(r.json.code, 'connection')
+  assert.equal(h.gateway.calls.every((c) => c.url.startsWith('http://127.0.0.1:3425')), true)
+})
+
+test('an HTTP error is not retried on another candidate', async () => {
+  const h = await loadHost(
+    { gatewayUrl: 'http://127.0.0.1:3425' },
+    { gatewayJson: { addr: '127.0.0.1:4599' }, failStatus: { '/v1/magpie/usage': 500 } },
+  )
+  // The gateway answers 500: the base is alive, so another base would be noise.
+  const before = h.gateway.calls.length
+  const r = await call(h.routes.get(DATA), makeReq(DATA + '?path=usage'))
+  assert.equal(r.status, 502)
+  assert.equal(r.json.code, 'server_error')
+  assert.equal(h.gateway.calls.length, before + 1)
+})
+
+test('config exposes the discovery switch', async () => {
+  const h = await loadHost()
+  const r = await call(h.routes.get(CONF), makeReq(CONF))
+  assert.equal(r.json.config.discover, true)
+})
+
+// ---- shared reads, cancellation and discovery cost -------------------------
+
+test('concurrent snapshot calls share one gateway read', async () => {
+  const h = await loadHost({}, { delay: { '/v1/magpie/usage': 20 } })
+  const route = h.routes.get(SNAP)
+  const [a, b] = await Promise.all([
+    call(route, makeReq(SNAP + '?period=today')),
+    call(route, makeReq(SNAP + '?period=today')),
+  ])
+  assert.equal(a.status, 200)
+  assert.equal(b.status, 200)
+  assert.deepEqual(a.json.usage.calls, b.json.usage.calls)
+  const usageReads = h.gateway.calls.filter((c) => c.path === '/v1/magpie/usage').length
+  assert.equal(usageReads, 1, 'the panel tick, a manual refresh and the tool must not each open a read')
+})
+
+test('a caller that leaves does not cancel a read another caller is sharing', async () => {
+  const h = await loadHost({}, { delay: { '/v1/magpie/usage': 25 } })
+  const route = h.routes.get(SNAP)
+  const closing = makeReq(SNAP)
+  const first = call(route, closing)
+  const second = call(route, makeReq(SNAP))
+  closing.emit('close') // the panel closes; the agent tool is still waiting
+  const [left, kept] = await Promise.all([first, second])
+  assert.equal(left.status, 502)
+  assert.equal(left.json.code, 'aborted', 'the caller that left is told it was interrupted')
+  assert.equal(kept.status, 200, 'the remaining caller still gets its answer')
+  assert.equal(kept.json.ok, true)
+  assert.equal(h.gateway.calls.filter((c) => c.path === '/v1/magpie/usage').length, 1)
+})
+
+test('the detail read stops when the panel closes it', async () => {
+  const h = await loadHost({}, { hang: { '/v1/magpie/quotas': true } })
+  const req = makeReq(DATA + '?path=quotas')
+  const started = Date.now()
+  const pending = call(h.routes.get(DATA), req)
+  await new Promise((r) => setTimeout(r, 10))
+  req.emit('close')
+  const r = await pending
+  assert.equal(r.status, 502)
+  // the 10 s budget would also end the read; closing the panel must end it now
+  assert.ok(Date.now() - started < 2000, 'the read ends when the panel closes, not on its budget')
+  const record = h.gateway.calls.find((c) => c.path === '/v1/magpie/quotas')
+  assert.equal(record.init.signal.aborted, true, 'the upstream fetch goes down with the request')
+})
+
+test('a detail read that needs a parameter refuses without it', async () => {
+  const h = await loadHost({})
+  const missing = await call(h.routes.get(DATA), makeReq(DATA + '?path=route'))
+  assert.equal(missing.status, 400)
+  assert.match(missing.json.error, /session/)
+  const ok = await call(h.routes.get(DATA), makeReq(DATA + '?path=route&session=abc'))
+  assert.equal(ok.status, 200)
+  const record = h.gateway.calls.find((c) => c.path === '/v1/magpie/route')
+  assert.equal(record.query.get('session'), 'abc')
+})
+
+test('gateway.json is read once per discovery window, not once per read', async () => {
+  const h = await loadHost({}, { gatewayJson: { addr: '127.0.0.1:3425', pid: 1 } })
+  const route = h.routes.get(SNAP)
+  await call(route, makeReq(SNAP + '?period=today'))
+  await call(route, makeReq(SNAP + '?period=7d')) // a different period misses the snapshot cache
+  assert.equal(h.fsReads.length, 1, 'discovery must not put a synchronous disk read on every refresh')
 })

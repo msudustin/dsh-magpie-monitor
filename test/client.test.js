@@ -18,12 +18,39 @@ const source = readFileSync(path.join(here, '..', 'client.js'), 'utf8')
 
 // ---- fake React with a real hook dispatcher ----
 let active = null
+// The flight strip builds its wire from the measured box, so tests need to say
+// how wide the sidebar is; a ref stands in for the real DOM node.
+let boxWidth = 320
+function setBoxWidth(w) { boxWidth = w }
+// The strip measures the two outer marks, so the fake DOM needs to answer for
+// them: null keeps the old "26px from either edge" fallback.
+let markEdges = null
+function setMarkEdges(left, right) { markEdges = left === null ? null : { left, right } }
 function makeReact() {
   const React = {
     Fragment: Symbol.for('react.fragment'),
     createElement(type, props, ...children) {
       const flat = children.flat(Infinity)
-      return { type, props: { ...(props || {}), children: flat }, children: flat }
+      const next = { ...(props || {}), children: flat }
+      if (next.ref && typeof next.ref === 'object') {
+        const edge = next['data-edge']
+        const node = { clientWidth: boxWidth, offsetWidth: boxWidth }
+        if (markEdges) {
+          node.getBoundingClientRect = () => {
+            if (edge === 'left') {
+              const left = markEdges.left - 10
+              return { left, right: left + 20, width: 20, top: 20, bottom: 40, height: 20 }
+            }
+            if (edge === 'right') {
+              const left = markEdges.right - 10
+              return { left, right: left + 20, width: 20, top: 20, bottom: 40, height: 20 }
+            }
+            return { left: 0, right: boxWidth, width: boxWidth, top: 0, bottom: 58, height: 58 }
+          }
+        }
+        next.ref.current = node
+      }
+      return { type, props: next, children: flat }
     },
     useState(init) {
       const s = active
@@ -71,15 +98,28 @@ function makeReact() {
   return React
 }
 
+// Function components rendered by flatten() get their own hook session, the way
+// React keeps one per instance; anything they schedule is collected by the root
+// session so a single unmount still tears everything down.
+let rootSession = null
 function mount(React, Component, props) {
-  const session = { hooks: [], index: 0, queue: [], cleanups: new Map(), dirty: false, passes: 0 }
+  const session = { hooks: [], index: 0, queue: [], cleanups: new Map(), dirty: false, passes: 0, children: [], hookCounts: [] }
+  rootSession = session
+  childSessions.clear()
   let tree = null
   const pass = () => {
     if (session.passes++ > 80) throw new Error('render loop')
     session.index = 0
     session.queue = []
     active = session
-    try { tree = Component(props) } finally { active = null }
+    let used = 0
+    try { tree = Component(props); used = session.index } finally { active = null }
+    // React requires the same number of hooks on every render; a component that
+    // calls another component inline instead of rendering it violates that.
+    if (session.hookCounts.length > 0 && session.hookCounts[0] !== used) {
+      throw new Error('hook order changed: first pass used ' + session.hookCounts[0] + ' hooks, this pass used ' + used)
+    }
+    session.hookCounts.push(used)
     for (const item of session.queue) {
       const prev = session.cleanups.get(item.key)
       if (typeof prev === 'function') prev()
@@ -91,27 +131,61 @@ function mount(React, Component, props) {
   return {
     flush() { let g = 0; while (session.dirty && g++ < 80) { session.dirty = false; pass() } },
     tree: () => tree,
-    unmount() { for (const c of session.cleanups.values()) if (typeof c === 'function') c(); session.cleanups.clear() },
+    unmount() {
+      for (const child of session.children) for (const c of child.cleanups.values()) if (typeof c === 'function') c()
+      for (const c of session.cleanups.values()) if (typeof c === 'function') c()
+      session.children.length = 0
+      session.cleanups.clear()
+    },
   }
 }
 
 // Expand pure child components + classes into host elements for assertions.
-function flatten(React, el, depth = 0) {
+// Child components keep their hook state between passes the way React keeps one
+// session per instance; a component that measures its box (useBoxWidth) renders
+// once with the fallback and again with the real width, so the tree is rendered
+// until it stops asking to re-render. Identity is positional, like React's.
+const childSessions = new Map()
+function flatten(React, el, depth = 0, pathKey = '') {
   if (depth > 80) throw new Error('flatten depth')
   if (el === null || el === undefined || typeof el === 'boolean') return []
-  if (Array.isArray(el)) return el.flatMap((c) => flatten(React, c, depth + 1))
+  if (Array.isArray(el)) return el.flatMap((c, i) => flatten(React, c, depth + 1, pathKey + '[' + i + ']'))
   if (typeof el === 'string' || typeof el === 'number') return [{ type: '#text', text: String(el), props: {}, children: [] }]
   if (typeof el !== 'object') return []
   const { type, props, children } = el
-  if (type === React.Fragment) return flatten(React, children, depth + 1)
+  if (type === React.Fragment) return flatten(React, children, depth + 1, pathKey + '#f')
   if (typeof type === 'function') {
     if (type.prototype && type.prototype.__fake) {
       const inst = new type({ ...props, children })
-      return flatten(React, inst.render(), depth + 1)
+      return flatten(React, inst.render(), depth + 1, pathKey)
     }
-    return flatten(React, type({ ...props, children }), depth + 1)
+    const key = pathKey + '<' + (type.name || 'anon')
+    let child = childSessions.get(key)
+    if (!child) {
+      child = { hooks: [], index: 0, queue: [], cleanups: new Map(), dirty: false, passes: 0 }
+      childSessions.set(key, child)
+      if (rootSession) rootSession.children.push(child)
+    }
+    const outer = active
+    let out
+    for (let round = 0; round < 8; round++) {
+      if (child.passes++ > 40) throw new Error('child render loop: ' + key)
+      child.dirty = false
+      child.index = 0
+      child.queue = []
+      active = child
+      try { out = type({ ...props, children }) } finally { active = outer }
+      for (const item of child.queue) {
+        const prev = child.cleanups.get(item.key)
+        if (typeof prev === 'function') prev()
+        const cleanup = item.fn()
+        child.cleanups.set(item.key, typeof cleanup === 'function' ? cleanup : null)
+      }
+      if (!child.dirty) break
+    }
+    return flatten(React, out, depth + 1, key)
   }
-  return [{ type, props: props || {}, children: flatten(React, children, depth + 1) }]
+  return [{ type, props: props || {}, children: flatten(React, children, depth + 1, pathKey + '.' + type) }]
 }
 
 function texts(nodes) {
@@ -145,6 +219,8 @@ function snapshotFixture(over = {}) {
       { route_id: 'r2', t: '2026-11-15T11:00:00+08:00', agent: 'cc', agentName: 'cc', provider: 'zcode', providerName: 'ZCode', providerAccount: '', model: 'glm-5.3', req: 'group/y', served: 'glm-5.3', ep: '', access: '', session: '', in: 1, out: 2, cacheRead: 0, reasoning: 0, ms: 900, ttftMs: 300, status: 200, cost: 0.02, priced: true },
     ],
     models: [{ id: 'm1', provider: 'p', model: 'frontier-1', name: 'frontier-1', sub: 'P', calls: 10, errors: 0, input: 1, output: 2, cacheRead: 3, cost: 1.5, unpriced: 0 }],
+    speeds: [{ model: 'glm-5.3', name: 'glm-5.3', requests: 400, tps: 83, tpsN: 71, ttftMs: 800, cost: 1.4 }],
+    channels: { through: { calls: 640, errors: 1, cost: 1.8 }, direct: { calls: 223, errors: 1, cost: 0.7 }, reported: { calls: 0, errors: 0, cost: 0 } },
     statusline: '', problems: [],
     ...over,
   }
@@ -157,6 +233,7 @@ function makeEnv(opts = {}) {
   const writes = []
   const listeners = { window: {}, document: {} }
   const timers = { intervals: new Set(), timeouts: new Set() }
+  const delays = []
   const fetchCalls = []
   let responder = opts.responder || (() => ({ ok: true, status: 200, json: async () => snapshotFixture() }))
   const mockFetch = (url, init) => { fetchCalls.push({ url: String(url), init }); return Promise.resolve(responder(String(url), init)) }
@@ -182,14 +259,14 @@ function makeEnv(opts = {}) {
     encodeURIComponent, decodeURIComponent, isNaN,
     setTimeout: (fn, ms) => { const id = setTimeout(fn, ms); timers.timeouts.add(id); return id },
     clearTimeout: (id) => { timers.timeouts.delete(id); clearTimeout(id) },
-    setInterval: (fn, ms) => { const id = setInterval(fn, ms); timers.intervals.add(id); return id },
+    setInterval: (fn, ms) => { const id = setInterval(fn, ms); timers.intervals.add(id); delays.push(ms); return id },
     clearInterval: (id) => { timers.intervals.delete(id); clearInterval(id) },
     requestAnimationFrame: (fn) => { const id = setTimeout(fn, 0); timers.timeouts.add(id); return id },
     cancelAnimationFrame: (id) => { timers.timeouts.delete(id); clearTimeout(id) },
   }
   const context = vm.createContext(sandbox)
   const env = {
-    React, window, document, storage, writes, fetchCalls, timers, listeners, context,
+    React, window, document, storage, writes, fetchCalls, timers, delays, listeners, context,
     setResponder: (r) => { responder = r },
     emit: (target, evt) => { for (const cb of listeners[target][evt] || []) cb() },
     dispose: () => { for (const id of timers.intervals) clearInterval(id); for (const id of timers.timeouts) clearTimeout(id); timers.intervals.clear(); timers.timeouts.clear() },
@@ -283,7 +360,7 @@ test('mount fetches one merged snapshot and renders usage/quota/model', async ()
   const txt = texts(nodes).join('|')
   assert.ok(txt.includes('829'), 'calls rendered')
   assert.ok(txt.includes('$2.65'), 'cost rendered')
-  assert.ok(txt.includes('39%'), 'quota pct rounded')
+  assert.ok(txt.includes('剩余 61%'), 'quota shows the remaining share, rounded')
   assert.ok(txt.includes('TTFT 4.7 s'), 'derived ttft')
   assert.ok(txt.includes('42 tok/s'), 'derived speed')
   assert.ok(txt.includes('缓存 75%'), 'cache hit')
@@ -291,13 +368,40 @@ test('mount fetches one merged snapshot and renders usage/quota/model', async ()
   assert.equal(byClass(nodes, 'mgp-chart').length, 1, 'activity chart present')
   assert.equal(byClass(nodes, 'mgp-bar').length, 2)
   assert.equal(byClass(nodes, 'mgp-spark').length, 1, 'quota sparkline matched from history')
-  assert.equal(byClass(nodes, 'mgp-tab').length, 3, 'period tabs')
+  assert.equal(byClass(nodes, 'mgp-tab').length, 4, 'period tabs, all-time included')
   assert.equal(byClass(nodes, 'mgp-dot-on').length >= 1, true, 'online dot')
   assert.equal(byClass(nodes, 'mgp-statusbtn').length, 1, 'one merged status/refresh control')
   assert.equal(byClass(nodes, 'mgp-fbtn').length, 1, 'only the mask button is left in the header')
   const latestMeta = byClass(nodes, 'mgp-latest-meta')[0]
   assert.ok(texts([latestMeta]).join('|').includes('tok/s'), 'latest route shows output rate, not duration')
   assert.ok(String(latestMeta.props.title).includes('输出速率'), 'rate tooltip names the metric')
+  m.unmount(); s.env.dispose()
+})
+
+test('the live stamp parses whichever shape the gateway used', async () => {
+  const s = setup()
+  // .NET hands the panel "2026-11-16T13:26:45.2318564+08:00" — seven fraction
+  // digits, which Number() flattens to NaN and Date.parse rejects outright.
+  const stamp = (ms) => {
+    const d = new Date(ms)
+    const pad = (n, w = 2) => String(Math.abs(n)).padStart(w, '0')
+    const off = -d.getTimezoneOffset()
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds()) + '.' + pad(d.getMilliseconds()) + '1234' + (off >= 0 ? '+' : '-') + pad(Math.floor(Math.abs(off) / 60)) + ':' + pad(Math.abs(off) % 60)
+  }
+  const now = Date.now()
+  const snap = snapshotFixture()
+  snap.requests[0].t = stamp(now - 2000)
+  s.env.setResponder(() => ({ ok: true, status: 200, json: async () => snap }))
+  const m = mountFooter(s)
+  await settle(); m.flush()
+  const nodes = render(s, m)
+  const clock = byClass(nodes, 'mgp-rtime').map((n) => texts([n]).join('')).filter(Boolean)
+  assert.ok(clock.length >= 1, 'the request row shows its clock')
+  assert.match(clock[0], /^\d{2}:\d{2}:\d{2}$/)
+  const chips = byClass(nodes, 'mgp-status')
+  assert.ok(chips.length >= 1)
+  assert.equal(chips.some((c) => c.props.className.includes('mgp-status-idle')), false, 'a two second old success is live, not idle')
+  assert.equal(byClass(nodes, 'mgp-route')[0].props['data-live'], '1', 'the flight strip is live while a request is recent')
   m.unmount(); s.env.dispose()
 })
 
@@ -481,7 +585,7 @@ test('settings page renders style cards, content toggles and a live preview with
   await settle(); m.flush()
   const nodes = render(s, m)
   assert.equal(byClass(nodes, 'mgp-style-card').length, 3, 'three style cards')
-  assert.equal(byClass(nodes, 'mgp-toggle-row').length, 10, '8 content + 2 preference toggles')
+  assert.equal(byClass(nodes, 'mgp-toggle-row').length, 16, '9 content + 5 detail + 2 preference toggles')
   assert.equal(byClass(nodes, 'mgp-preview-frame').length, 1, 'live preview frame')
   assert.equal(byClass(nodes, 'mgp-footstack').length, 1, 'preview renders the real widget body')
   assert.equal(byClass(nodes, 'mgp-note').length, 1, 'config unavailable note when no configForms')
@@ -514,6 +618,24 @@ test('a content toggle hides its block in the preview and persists', async () =>
   m.flush()
   assert.equal(displayEnv(s).ui.show.chart, false)
   assert.equal(byClass(render(s, m), 'mgp-chart').length, 0, 'chart hidden in preview')
+  m.unmount(); s.env.dispose()
+})
+
+test('the fine print honours its own switches: flight strip and request meta', async () => {
+  const s = setup()
+  const m = mountSettings(s)
+  await settle(); m.flush()
+  assert.equal(byClass(render(s, m), 'mgp-route').length, 1, 'flight strip visible by default')
+  assert.equal(byClass(render(s, m), 'mgp-req-meta').length, 1, 'request meta visible by default')
+  byClass([rowByLabel(render(s, m), '喜鹊飞线')], 'mgp-switch')[0].props.onClick()
+  byClass([rowByLabel(render(s, m), '请求明细')], 'mgp-switch')[0].props.onClick()
+  m.flush()
+  assert.equal(displayEnv(s).ui.show.flight, false)
+  assert.equal(displayEnv(s).ui.show.reqmeta, false)
+  const after = render(s, m)
+  assert.equal(byClass(after, 'mgp-route').length, 0, 'flight strip hidden')
+  assert.equal(byClass(after, 'mgp-req-meta').length, 0, 'request meta hidden')
+  assert.equal(byClass(after, 'mgp-today').length, 1, 'totals untouched by the other switches')
   m.unmount(); s.env.dispose()
 })
 
@@ -610,4 +732,494 @@ test('minimal style keeps a compact status control without a label', async () =>
   assert.equal(byClass(nodes, 'mgp-statusbtn-label').length, 0, 'no text label in minimal mode')
   assert.equal(byClass(nodes, 'mgp-fbtn').length, 0, 'minimal line has no extra buttons')
   mf.unmount(); ms.unmount(); s.env.dispose()
+})
+
+test('the details show gateway-measured model speeds and the traffic split', async () => {
+  const s = setup()
+  const mf = mountFooter(s)
+  await settle(); mf.flush()
+  const ms = mountSettings(s)
+  await settle(); ms.flush()
+  // expand the details so the new blocks are rendered
+  const expand = byClass(render(s, mf), 'mgp-expand')[0]
+  expand.props.onClick()
+  mf.flush()
+  const nodes = render(s, mf)
+  assert.ok(texts(nodes).join('|').includes('83'), 'the measured tokens/s shows up')
+  assert.ok(byClass(nodes, 'mgp-speed').length >= 1, 'speed rows are rendered')
+  assert.ok(byClass(nodes, 'mgp-channel').length >= 1, 'channel rows are rendered')
+  mf.unmount(); ms.unmount(); s.env.dispose()
+})
+
+test('the quota bar measures what is left, not what is spent', async () => {
+  const s = setup({
+    responder: () => ({
+      ok: true, status: 200,
+      json: async () => snapshotFixture({
+        quotas: [{
+          provider: 'zcode', name: 'ZCode', plan: 'Start', user: 'u1', alias: '134****0000',
+          windows: [
+            { name: 'fresh', used: 0, remaining: 100, display: '0 / 3,000,000' },
+            { name: 'spent', used: 100, remaining: 0, display: '3,000,000 / 3,000,000' },
+            { name: 'partway', used: 72, remaining: 28, display: '2,160,000 / 3,000,000' },
+          ],
+        }],
+        history: [],
+      }),
+    }),
+  })
+  const m = mountFooter(s)
+  await settle(); m.flush()
+  byClass(render(s, m), 'mgp-expand')[0].props.onClick()
+  m.flush()
+  const nodes = render(s, m)
+  const rows = byClass(nodes, 'mgp-qbar')
+  assert.equal(rows.length, 3, 'one bar per window')
+  const widths = byClass(nodes, 'mgp-fill').map((f) => f.props.style.width)
+  // urgent windows come first, and the bar is the share LEFT: an untouched
+  // quota draws full, an exhausted one draws empty. Reading "used" here put an
+  // empty bar and "0% left" on a window nobody had touched.
+  assert.deepEqual(widths, ['0%', '28%', '100%'])
+  const txt = texts(rows).join('|')
+  assert.ok(txt.includes('剩余 100%'), 'a fresh window says 100% left')
+  assert.ok(txt.includes('剩余 0%'), 'an exhausted window says 0% left')
+  assert.equal(rows[2].props['aria-valuenow'], 100, 'the bar reports the share left')
+  m.unmount(); s.env.dispose()
+})
+
+test('grouping the recent list by session keeps the panel alive', async () => {
+  // Regression: SessLine referenced a name that only ReqLine had in scope, so
+  // the 按会话 switch threw during render and the host showed the error card.
+  const s = setup()
+  const mf = mountFooter(s)
+  await settle(); mf.flush()
+  byClass(render(s, mf), 'mgp-expand')[0].props.onClick()
+  mf.flush()
+  const segs = byClass(render(s, mf), 'mgp-segbtn')
+  assert.equal(segs.length, 2, 'request/session switch is there')
+  segs[1].props.onClick()
+  mf.flush()
+  const nodes = render(s, mf)
+  assert.equal(byClass(nodes, 'mgp-problems').length, 0, 'nothing blew up')
+  const rows = byClass(nodes, 'mgp-req')
+  assert.ok(rows.length >= 1, 'session rows render')
+  const text = texts(rows).join(' ')
+  assert.ok(text.includes('请求'), 'a session row counts its requests')
+  assert.ok(byClass(nodes, 'mgp-served').length >= 1, 'the session row shows the model it ran on')
+  mf.unmount(); s.env.dispose()
+})
+
+test('a failing endpoint is reported with a translated reason, not a raw string', async () => {
+  const s = setup({
+    responder: () => ({
+      ok: true, status: 200,
+      json: async () => snapshotFixture({
+        problems: [{ what: '额度', code: 'connection', message: 'raw host sentence' }],
+      }),
+    }),
+  })
+  const mf = mountFooter(s)
+  await settle(); mf.flush()
+  const nodes = render(s, mf)
+  const problems = byClass(nodes, 'mgp-problems')[0]
+  assert.ok(problems, 'the problem row is rendered')
+  const text = texts([problems]).join(' ')
+  assert.ok(text.includes('额度'), 'the failing part is named')
+  assert.ok(text.includes('网关连不上'), 'the reason is translated')
+  assert.ok(!text.includes('raw host sentence'), 'the raw host sentence is replaced')
+  mf.unmount(); s.env.dispose()
+})
+
+test('the rail icon opens a popup card that closes on Escape', async () => {
+  const s = setup()
+  const mf = mountFooter(s, { wide: false })
+  await settle(); mf.flush()
+  assert.equal(byClass(render(s, mf), 'mgp-railpopup').length, 0, 'popup starts closed')
+  const icon = byClass(render(s, mf), 'mgp-railwrap')[0]
+  icon.props.onClick()
+  mf.flush()
+  assert.equal(byClass(render(s, mf), 'mgp-railpopup').length, 1, 'clicking the icon opens the popup')
+  const popup = byClass(render(s, mf), 'mgp-railpopup')[0]
+  assert.ok(texts([popup]).join('|').includes('829'), 'the popup carries the numbers')
+  // Escape closes it
+  const keyHandlers = s.env.listeners.document.keydown || []
+  assert.ok(keyHandlers.length >= 1, 'a keydown listener is registered')
+  for (const cb of keyHandlers) cb({ key: 'Escape' })
+  mf.flush()
+  assert.equal(byClass(render(s, mf), 'mgp-railpopup').length, 0, 'Escape closes the popup')
+  mf.unmount(); s.env.dispose()
+})
+
+test('the settings page can turn gateway discovery off', async () => {
+  const s = setup()
+  s.ctx.configForms = fakeConfigForms({ ...baseCfg, discover: true }, true)
+  const ms = mountSettings(s)
+  await settle(); ms.flush()
+  const row = fieldByLabel(render(s, ms), '自动发现网关')
+  assert.ok(row, 'the discovery switch is in the settings page')
+  const sw = byClass([row], 'mgp-switch')[0]
+  assert.equal(sw.props['aria-checked'], true, 'discovery starts on')
+  sw.props.onClick()
+  await settle()
+  assert.equal(s.ctx.configForms._ctrl.getSnapshot().value.discover, false, 'the host config is updated')
+  ms.unmount(); s.env.dispose()
+})
+
+// ---- review fixes (2026-11): one test per defect found in the last pass -----
+
+test('a re-render does not re-parse the persisted envelope', async () => {
+  const s = setup()
+  const read = s.env.window.localStorage.getItem
+  let parses = 0
+  // STORE_KEY is the snapshot envelope: up to 300 KB of JSON per parse
+  s.env.window.localStorage.getItem = (k) => { if (k === 'dsh-magpie-monitor:v1') parses++; return read(k) }
+  const m = mountFooter(s)
+  await settle(); m.flush()
+  const afterMount = parses
+  assert.ok(afterMount <= 2, 'one migration read plus one mount read, got ' + afterMount)
+  byClass(render(s, m), 'mgp-tab')[1].props.onClick()
+  m.flush()
+  byClass(render(s, m), 'mgp-fbtn')[0].props.onClick()
+  m.flush()
+  assert.equal(parses, afterMount, 'later renders must not re-parse the envelope')
+  m.unmount(); s.env.dispose()
+})
+
+test('two quick mask clicks toggle twice instead of sticking', async () => {
+  const s = setup()
+  const m = mountFooter(s)
+  await settle(); m.flush()
+  const maskButton = () => byClass(render(s, m), 'mgp-fbtn')[0]
+  assert.equal(maskButton().props['aria-pressed'], false)
+  // both clicks land before React re-renders: a stale ref would hand the second
+  // click the pre-click value and mask the amounts anyway
+  maskButton().props.onClick()
+  maskButton().props.onClick()
+  m.flush()
+  assert.equal(maskButton().props['aria-pressed'], false, 'two clicks = back to unmasked')
+  assert.ok(!texts(render(s, m)).join('|').includes('••••'), 'amounts stay readable')
+  // and a single click still masks
+  maskButton().props.onClick()
+  m.flush()
+  assert.equal(maskButton().props['aria-pressed'], true)
+  assert.ok(texts(render(s, m)).join('|').includes('••••'))
+  m.unmount(); s.env.dispose()
+})
+
+test('the rail popup opens again after it was closed', async () => {
+  const s = setup()
+  const m = mountFooter(s, { wide: false })
+  await settle(); m.flush()
+  const open = () => {
+    byClass(render(s, m), 'mgp-railwrap')[0].props.onClick()
+    m.flush()
+    return byClass(render(s, m), 'mgp-railpopup').length
+  }
+  assert.equal(open(), 1)
+  for (const cb of s.env.listeners.document.keydown || []) cb({ key: 'Escape' })
+  m.flush()
+  assert.equal(byClass(render(s, m), 'mgp-railpopup').length, 0)
+  // the popup owns hooks; rendering it as a call would leave the parent's hook
+  // list shorter than the previous pass and React would throw here
+  assert.equal(open(), 1, 'reopening keeps the hook order stable')
+  m.unmount(); s.env.dispose()
+})
+
+test('the stale banner and the chart label speak the panel language', async () => {
+  const s = setup()
+  const m = mountFooter(s)
+  await settle(); m.flush()
+  s.setLang('en')
+  s.env.setResponder(() => ({ ok: false, status: 502, json: async () => ({ ok: false, code: 'server_error' }) }))
+  byClass(render(s, m), 'mgp-statusbtn')[0].props.onClick()
+  await settle(); m.flush()
+  const nodes = render(s, m)
+  const flat = texts(nodes).join('|')
+  assert.ok(byClass(nodes, 'mgp-stale').length === 1)
+  assert.ok(/ago|just now/.test(flat), 'relative time is English in the English panel: ' + flat)
+  assert.ok(!flat.includes('分钟前'), 'no Chinese leaks into the English panel')
+  assert.ok(flat.includes('the gateway failed internally'), 'the reason is translated too')
+  const chart = byClass(nodes, 'mgp-chart')[0]
+  assert.ok(chart, 'chart still drawn')
+  assert.equal(chart.props['aria-label'], 'calls per bucket')
+  m.unmount(); s.env.dispose()
+})
+
+test('a failed first read names the reason next to the retry button', async () => {
+  const s = setup({
+    responder: () => ({ ok: false, status: 502, json: async () => ({ ok: false, code: 'connection', error: 'ECONNREFUSED' }) }),
+  })
+  const m = mountFooter(s)
+  await settle(); m.flush()
+  const flat = texts(render(s, m)).join('|')
+  assert.equal(byClass(render(s, m), 'mgp-banner').length, 1)
+  assert.ok(flat.includes('网关连不上'), 'the host code is turned into a sentence: ' + flat)
+  assert.ok(!flat.includes('ECONNREFUSED'), 'never the raw upstream string')
+  m.unmount(); s.env.dispose()
+})
+
+test('the panel follows the host period until a tab is clicked', async () => {
+  const fixture = snapshotFixture()
+  fixture.config = { ...fixture.config, period: '7d' }
+  const s = setup({ responder: () => ({ ok: true, status: 200, json: async () => fixture }) })
+  const m = mountFooter(s)
+  await settle(); m.flush()
+  // the first read cannot know the host period yet; after it lands the panel
+  // adopts it, so the next read asks for the right window
+  byClass(render(s, m), 'mgp-statusbtn')[0].props.onClick()
+  await settle(); m.flush()
+  assert.equal(s.env.fetchCalls.at(-1).url, '/magpie-monitor/api/snapshot?period=7d&recent=40&fresh=1', 'the host default is adopted')
+  const nodes = render(s, m)
+  const tabs = byClass(nodes, 'mgp-tab')
+  assert.equal(tabs[1].props['aria-selected'], true, 'the 7d tab is the selected one')
+  m.unmount(); s.env.dispose()
+})
+
+test('a gateway that stays down is asked less and less often', async () => {
+  const s = setup({
+    responder: () => ({ ok: false, status: 502, json: async () => ({ ok: false, code: 'connection' }) }),
+  })
+  const m = mountFooter(s)
+  await settle(); m.flush()
+  assert.equal(s.env.delays[0], 5000, 'the first tick keeps the configured interval')
+  const refresh = () => { byClass(render(s, m), 'mgp-statusbtn')[0].props.onClick() }
+  for (let i = 0; i < 2; i++) { refresh(); await settle(); m.flush() }
+  assert.ok(s.env.delays.at(-1) >= 20000, 'two failures back off to 20s, got ' + s.env.delays.at(-1))
+  const highest = Math.max(...s.env.delays)
+  // one good read puts the interval back where the settings say it should be
+  s.env.setResponder(() => ({ ok: true, status: 200, json: async () => snapshotFixture() }))
+  refresh(); await settle(); m.flush()
+  assert.ok(s.env.delays.at(-1) < highest, 'recovery restores the fast interval')
+  assert.equal(s.env.delays.at(-1), 5000)
+  m.unmount(); s.env.dispose()
+})
+
+// ---- layout: the strip must fit whatever width the sidebar is opened at ----
+// The wire used to be drawn in one fixed 320-unit viewBox, so at the sidebar's
+// widest setting it was letterboxed (the line stopped short of the marks) and
+// at its narrowest it squeezed. It is now built from the measured box.
+function styleText(nodes) {
+  const style = findAll(nodes, (n) => n.type === 'style')[0]
+  return style ? texts([style]).join('') : ''
+}
+function wireEnd(route) {
+  const path = byClass([route], 'mgp-wire')[0]
+  const d = String(path.props.d || '')
+  const nums = d.match(/-?\d+(?:\.\d+)?/g) || []
+  const end = nums.slice(-2).map(Number)
+  assert.ok(nums.length > 0, 'the wire has geometry: ' + d)
+  return { end, d, path }
+}
+
+test('the flight wire is drawn to the box it sits in, not to a fixed 320', async () => {
+  for (const width of [260, 320, 480]) {
+    setBoxWidth(width)
+    const s = setup()
+    const m = mountFooter(s)
+    await settle(); m.flush()
+    const nodes = render(s, m)
+    const route = byClass(nodes, 'mgp-route')[0]
+    const svg = byClass(nodes, 'mgp-route-wire')[0]
+    assert.equal(svg.props.viewBox, '0 0 ' + width + ' 58', 'the drawing space follows the box at ' + width)
+    const { end } = wireEnd(route)
+    assert.deepEqual(end, [width - 26, 30], 'the wire starts and ends at the marks at ' + width)
+    m.unmount(); s.env.dispose()
+  }
+  setBoxWidth(320)
+})
+
+test('the magpie hub rides the wire between the two lanes, not the row of marks', async () => {
+  setBoxWidth(360)
+  const s = setup()
+  const m = mountFooter(s)
+  await settle(); m.flush()
+  const nodes = render(s, m)
+  const route = byClass(nodes, 'mgp-route')[0]
+  const row = byClass(nodes, 'mgp-route-nodes')[0]
+  const isMid = (n) => String((n && n.props && n.props.className) || '').includes('mgp-node-mid')
+  assert.equal(route.children.filter(isMid).length, 1, 'the hub is a child of the strip')
+  assert.equal(row.children.filter(isMid).length, 0, 'the hub is no longer a third mark in the row')
+  const order = route.children.map((c) => (isMid(c) ? 'hub' : c.type === 'svg' ? 'wire' : 'row'))
+  assert.deepEqual(order, ['wire', 'row', 'hub'], 'the hub paints after the wire so the bird crosses it')
+  m.unmount(); s.env.dispose()
+})
+
+// a snapshot whose last request is happening right now, so the birds are flying
+function liveSetup() {
+  const fresh = snapshotFixture().requests[0]
+  return setup({
+    responder: () => ({
+      ok: true,
+      status: 200,
+      json: async () => snapshotFixture({ requests: [Object.assign({}, fresh, { t: new Date().toISOString() })] }),
+    }),
+  })
+}
+
+test('the birds swing around the hub instead of flying through it', async () => {
+  setBoxWidth(360)
+  const s = liveSetup()
+  const m = mountFooter(s)
+  await settle(); m.flush()
+  const nodes = render(s, m)
+  const route = byClass(nodes, 'mgp-route')[0]
+  assert.equal(route.props['data-live'], '1', 'a request just went through, so the strip is live')
+  const motions = findAll(nodes, (n) => n.type === 'animateMotion')
+  assert.equal(motions.length, 2, 'one bird out, one bird back')
+  const wires = byClass([route], 'mgp-wire').map((p) => String(p.props.d))
+  const paths = motions.map((mo) => String(mo.props.path))
+  // The hub is 22px tall and sits at y 2..24 on the apex (y 12); the wire runs
+  // straight through it. Each bird keeps off it: it rides the wire up, dips to
+  // 31 (out) or 37 (back) while it crosses the mark, then rejoins the wire.
+  for (const d of paths) assert.ok(!wires.includes(d), 'the bird does not fly the wire itself')
+  assert.ok(paths[0].includes(' 31'), 'the way out clears the hub under it: ' + paths[0])
+  assert.ok(paths[1].includes(' 40'), 'and the way back takes the lower lane: ' + paths[1])
+  const farX = 360 - 26
+  assert.ok(paths[0].startsWith('M26 30'), 'the way out leaves the near mark: ' + paths[0])
+  assert.ok(paths[0].endsWith(' ' + farX + ' 30'), 'and lands on the far one: ' + paths[0])
+  assert.ok(paths[1].startsWith('M' + farX + ' 34'), 'the answer leaves the far mark: ' + paths[1])
+  assert.ok(paths[1].endsWith(' 26 34'), 'and flies back to the near one: ' + paths[1])
+  // Every number in the path is an x/y pair, so the odd slots are the heights.
+  const laneY = (d) => {
+    const nums = (d.match(/-?\d+(?:\.\d+)?/g) || []).map(Number)
+    const ys = nums.filter((_, i) => i % 2 === 1)
+    return { low: Math.max.apply(null, ys), high: Math.min.apply(null, ys) }
+  }
+  const out = laneY(paths[0])
+  const back = laneY(paths[1])
+  assert.ok(out.low <= 44 && back.low <= 50, 'both lanes stay inside the 58px strip: ' + out.low + '/' + back.low)
+  assert.ok(out.low >= 28 && back.low >= 34, 'neither lane climbs into the hub box (y 2..24): ' + out.low + '/' + back.low)
+  assert.ok(back.low - out.low >= 4, 'the two lanes stay apart so the birds never stack: ' + (back.low - out.low))
+  assert.ok(out.high >= 12 && back.high >= 12, 'each bird still rises to the arc it crosses: ' + out.high + '/' + back.high)
+  m.unmount(); s.env.dispose()
+  setBoxWidth(320)
+})
+
+test('the answer flies back the other way, one bird each way', async () => {
+  setBoxWidth(360)
+  const s = liveSetup()
+  const m = mountFooter(s)
+  await settle(); m.flush()
+  const nodes = render(s, m)
+  const motions = findAll(nodes, (n) => n.type === 'animateMotion')
+  assert.equal(motions.length, 2, 'one bird out, one bird back — never two on the same heading')
+  const xs = motions.map((mo) => {
+    const d = String(mo.props.path)
+    const first = Number((d.match(/^M(-?\d+(?:\.\d+)?)/) || [])[1])
+    const last = Number((d.match(/(-?\d+(?:\.\d+)?)(?:\s+-?\d+(?:\.\d+)?)?$/) || [])[1])
+    return { first, last }
+  })
+  assert.ok(xs[0].first < xs[0].last, 'the first bird heads right: ' + JSON.stringify(xs[0]))
+  assert.ok(xs[1].first > xs[1].last, 'the second heads left: ' + JSON.stringify(xs[1]))
+  m.unmount(); s.env.dispose()
+  setBoxWidth(320)
+})
+
+test('the wire ends on the two marks, not on a fixed inset', async () => {
+  setBoxWidth(360)
+  // a long provider label pushes the right mark well inside the strip
+  setMarkEdges(60, 250)
+  const s = setup()
+  const m = mountFooter(s)
+  await settle(); m.flush()
+  const nodes = render(s, m)
+  const route = byClass(nodes, 'mgp-route')[0]
+  const { d } = wireEnd(route)
+  assert.ok(d.startsWith('M60 30'), 'the line starts on the near mark: ' + d)
+  assert.ok(d.endsWith(' 250 30'), 'and stops on the far mark: ' + d)
+  const nums = (d.match(/-?\d+(?:\.\d+)?/g) || []).map(Number)
+  const xs = nums.filter((_, i) => i % 2 === 0)
+  assert.equal(Math.max.apply(null, xs), 250, 'nothing is drawn past the far mark: ' + d)
+  assert.equal(Math.min.apply(null, xs), 60, 'and nothing before the near one: ' + d)
+  m.unmount(); s.env.dispose()
+  setMarkEdges(null)
+  setBoxWidth(320)
+})
+
+test('the wire is solid while the birds are in the air', async () => {
+  const s = liveSetup()
+  const m = mountFooter(s)
+  await settle(); m.flush()
+  const css = styleText(render(s, m))
+  assert.match(css, /\.mgp-wire\s*\{[^}]*stroke-dasharray:\s*2 7/, 'idle traffic is drawn dashed')
+  assert.match(css, /\.mgp-route\[data-live="1"\]\s*\.mgp-wire\s*\{[^}]*stroke-dasharray:\s*none/, 'and solid while the route is carrying requests')
+  m.unmount(); s.env.dispose()
+})
+
+test('the hub mark carries no caption of its own', async () => {
+  setBoxWidth(360)
+  const s = setup()
+  const m = mountFooter(s)
+  await settle(); m.flush()
+  const route = byClass(render(s, m), 'mgp-route')[0]
+  const hub = byClass([route], 'mgp-node-mid')[0]
+  assert.equal(hub.children.length, 1, 'only the icon lives under the mark')
+  assert.equal(byClass([hub], 'mgp-node-name').length, 0, 'no name under the middle icon')
+  assert.equal(byClass([route], 'mgp-node-name').length, 2, 'the two ends keep theirs')
+  m.unmount(); s.env.dispose()
+  setBoxWidth(320)
+})
+
+test('the latest-request line clips its own columns instead of spilling over the meta', async () => {
+  const s = setup()
+  const m = mountFooter(s)
+  await settle(); m.flush()
+  const nodes = render(s, m)
+  // the head (label + time) and the meta column sit on one row: each has to be
+  // able to shrink, or the time prints on top of the provider name
+  const css = styleText(nodes)
+  assert.match(css, /\.mgp-latest-head\s*\{[^}]*overflow:\s*hidden/, 'the head clips rather than overflowing')
+  assert.match(css, /\.mgp-latest-meta\s*\{[^}]*overflow:\s*hidden/, 'the meta column clips too')
+  assert.match(css, /\.mgp-latest-label\s*\{[^}]*text-overflow:\s*ellipsis/)
+  const meta = byClass(nodes, 'mgp-latest-meta')[0]
+  const wrap = (meta.children || []).find((c) => String((c.props || {}).className || '').includes('mgp-latest-metatext'))
+  assert.ok(wrap, 'the meta text is its own ellipsis box')
+  assert.ok(texts([wrap]).join('').length > 0, 'and it still names the provider')
+  m.unmount(); s.env.dispose()
+})
+
+test('a narrow panel wraps the usage labels instead of cutting them', async () => {
+  const s = setup()
+  const m = mountFooter(s)
+  await settle(); m.flush()
+  const css = styleText(render(s, m))
+  // The panel must lay itself out intrinsically: a container query needs an
+  // ancestor that declares a container, and declaring one on the panel made the
+  // widget collapse inside the real sidebar (see the containment test below).
+  assert.match(css, /\.mgp-tcell\s*\{[^}]*flex-wrap:\s*wrap/, 'a squeezed cell wraps its label onto the next line')
+  assert.match(css, /\.mgp-tlab\s*\{[^}]*text-overflow:\s*ellipsis/, 'and still truncates as a last resort')
+  m.unmount(); s.env.dispose()
+})
+
+test('the panel never becomes a containment context', async () => {
+  const s = setup()
+  const m = mountFooter(s)
+  await settle(); m.flush()
+  const css = styleText(render(s, m))
+  // The real sidebar lays the footer out shrink-to-fit; an element with
+  // container-type has its inline size taken from the container and collapses to
+  // its min-content width there — measured at 8x350 px in a real browser, which
+  // is what "侧边栏 magpie 不能正常显示" looked like: one character per line.
+  assert.doesNotMatch(css, /container-type/, 'the panel is not a query container')
+  assert.doesNotMatch(css, /@container/, 'and no rule depends on one')
+  assert.match(css, /\.mgp-footstack\s*\{[^}]*max-height:\s*min\(50dvh,\s*440px\)/, 'its height budget comes from the viewport, not from containment')
+  m.unmount(); s.env.dispose()
+})
+
+test('the panel defines its own width and never styles the host around it', async () => {
+  const s = setup()
+  const m = mountFooter(s)
+  await settle(); m.flush()
+  const css = styleText(render(s, m))
+  // The host column is 264..420px wide (clampWidth in dsh-client-ui-layout) minus
+  // 12px of inline padding, so the slot hands the panel 240..396px and the footer
+  // wrapper is a plain flex row. Styling that wrapper (`:has()`, `[data-slot=…]`)
+  // reached outside the widget and is what left it narrow at maximum width.
+  assert.match(css, /\.mgp-footstack\s*\{[^}]*width:\s*100%/, 'the panel fills whatever the slot hands it')
+  assert.match(css, /\.mgp-footstack\s*\{[^}]*min-width:\s*0/, 'and can shrink below its content')
+  assert.doesNotMatch(css, /:has\(/, 'no :has() — it would match host elements too')
+  assert.doesNotMatch(css, /\[data-slot=/, 'the host slot element is not ours to style')
+  assert.doesNotMatch(css, /wtg9ga/, 'and neither are the sidebar plugin classes')
+  assert.match(css, /\.mgp-footstack\.rail\s*\{[^}]*width:\s*auto/, 'the rail collapses back to the icon')
+  m.unmount(); s.env.dispose()
 })

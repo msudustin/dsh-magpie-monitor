@@ -13,12 +13,23 @@
 // instead of two. Only fixed upstream paths are reachable and only a small set
 // of query parameters are forwarded, so none of these routes is an open proxy.
 
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import z from '@deepseek-ai/schemastery'
 
 export const Config = z.object({
   /** Base URL of the local Magpie gateway. */
   gatewayUrl: z.string().default('http://127.0.0.1:3425').volatile()
     .description('Magpie 网关根地址（不带 /v1），默认 http://127.0.0.1:3425'),
+  /**
+   * Discover the gateway address from Magpie's own `gateway.json` when the
+   * configured URL does not answer. Magpie writes the live listen address
+   * there (`{"addr":"127.0.0.1:3425","pid":...}`), so a user who moved the
+   * port is found without touching the settings. 0 disables discovery.
+   */
+  discover: z.boolean().default(true).volatile()
+    .description('网关连不上时自动从 Magpie 的 gateway.json 重新发现端口，默认 true'),
   /** Panel auto-refresh interval in milliseconds. */
   refreshMs: z.number().default(5000).volatile()
     .description('自动刷新间隔（毫秒），1000–120000，默认 5000'),
@@ -27,7 +38,7 @@ export const Config = z.object({
     .description('实时路由表拉取的最近请求条数，5–200，默认 40'),
   /** Default statistics window for the panel and the tool. */
   period: z.string().default('today').volatile()
-    .description('默认统计周期：today（按小时）/ 7d / 30d，默认 today'),
+    .description('默认统计周期：today（按小时）/ 7d / 30d / all，默认 today'),
   /**
    * The ledger prices in USD. A positive cnyRate converts every cost for
    * display; 0 leaves the USD numbers alone. Quota balances are not touched —
@@ -56,8 +67,28 @@ const UPSTREAM = {
   models: '/v1/models',
 }
 
-const PASS_QUERY = new Set(['limit', 'session', 'offset', 'period'])
-const PERIODS = new Set(['today', '7d', '30d'])
+/**
+ * Per-endpoint query rules. A flat allow-list would forward `period` to
+ * `/v1/magpie/quotas` (which ignores it) and `limit` to `/v1/magpie/route`
+ * (which wants `session`), so each endpoint declares what it accepts.
+ * `required` names must be present or the request is refused locally.
+ */
+const QUERY_RULES = {
+  root: { allowed: [] },
+  usage: { allowed: ['period'] },
+  requests: { allowed: ['limit', 'offset', 'period'] },
+  quotas: { allowed: [] },
+  history: { allowed: [] },
+  statusline: { allowed: [] },
+  route: { allowed: ['session'], required: ['session'] },
+  trace: { allowed: ['session'], required: ['session'] },
+  models: { allowed: [] },
+}
+
+// Kept for the /data route's own lookup and for the tests that pin the
+// forwarded set: it is the union of every endpoint's allowed keys.
+const PASS_QUERY = new Set(Object.values(QUERY_RULES).flatMap((rule) => rule.allowed))
+const PERIODS = new Set(['today', '7d', '30d', 'all'])
 const DEFAULT_GATEWAY = 'http://127.0.0.1:3425'
 
 // Per-endpoint budgets. Quota reads ask every provider and one unreachable host
@@ -94,6 +125,114 @@ function normalizeGateway(value) {
   }
 }
 
+/**
+ * Magpie keeps the address of its live gateway in `~/.config/magpie/gateway.json`
+ * (`{"addr":"127.0.0.1:3425","pid":26544,"serves":"tray","version":"..."}`).
+ * Reading it is the only reliable way to find the port when the user moved it:
+ * `settings.json` holds UI preferences and has no address at all.
+ *
+ * Candidates are ordered: explicit env, the file, then the historical default.
+ * Returns null when nothing usable is found so the caller can fall back.
+ */
+// gateway.json only changes when magpie restarts on another port, but the
+// panel reads it several times a second during a refresh. A short memo keeps
+// discovery honest without putting a synchronous disk read on the request
+// path; a connection failure clears it so a moved port is still recovered on
+// the next attempt.
+const DISCOVERY_MS = 4000
+let discoveredBases = null
+let discoveredAt = 0
+
+function invalidateDiscovery() {
+  discoveredBases = null
+  discoveredAt = 0
+}
+
+function discoverGatewayBases(now = Date.now()) {
+  if (discoveredBases !== null && now - discoveredAt < DISCOVERY_MS) return discoveredBases.slice()
+  const bases = []
+  const push = (value) => {
+    const origin = normalizeGateway(value)
+    if (origin !== null && !bases.includes(origin)) bases.push(origin)
+  }
+  for (const env of [process.env.MAGPIE_URL, process.env.MAGPIE_BASE_URL]) push(env)
+  try {
+    const home = os.homedir()
+    const file = path.join(home, '.config', 'magpie', 'gateway.json')
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'))
+    const addr = typeof raw?.addr === 'string' ? raw.addr : ''
+    if (addr !== '') {
+      // `addr` is a host:port pair; assume loopback because the gateway is local.
+      push(/:\d+$/.test(addr) ? `http://${addr}` : `http://${addr}:3425`)
+    }
+  } catch {
+    /* no gateway.json, unreadable, or malformed JSON: keep the other candidates */
+  }
+  push(DEFAULT_GATEWAY)
+  discoveredBases = bases
+  discoveredAt = now
+  return bases.slice()
+}
+
+/**
+ * Only same-machine requests may read the panel. A page on another origin
+ * could otherwise piggy-back on the user's gateway; the Host header must be a
+ * loopback literal, a cross-site fetch header is refused outright, and an
+ * Origin (when present) must match the Host.
+ */
+function isTrustedRequest(req) {
+  const headers = req?.headers ?? {}
+  const host = String(headers.host ?? '').trim().toLowerCase()
+  const hostname = host.replace(/:\d+$/, '')
+  const loopback = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname === '[::1]'
+  if (!loopback) return 'unexpected host'
+  if (String(headers['sec-fetch-site'] ?? '').toLowerCase() === 'cross-site') return 'cross-site request'
+  const origin = str(headers.origin)
+  if (origin !== undefined && origin !== 'null') {
+    try {
+      const originHost = new URL(origin).host.toLowerCase()
+      if (originHost !== host) return 'origin mismatch'
+    } catch {
+      return 'bad origin'
+    }
+  }
+  return null
+}
+
+/** Connection-phase failures mean "the gateway is not reachable", not "it said no". */
+const CONNECTION_PHASE_CODES = new Set([
+  'ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'ETIMEDOUT', 'EHOSTUNREACH', 'ENETUNREACH', 'ECONNRESET',
+])
+
+/** Marks an abort that came from the caller, so it is not blamed on the gateway. */
+const CALLER_ABORTED = 'ERR_CALLER_ABORTED'
+
+/**
+ * Classify a failure into a stable, translatable shape. The client turns the
+ * code into a sentence; the host never leaks a raw stack or URL to the UI.
+ */
+function classifyFailure(error) {
+  if (error === null || error === undefined) return { code: 'unknown', message: 'unknown error' }
+  const name = typeof error === 'object' && typeof error.name === 'string' ? error.name : ''
+  const message = describe(error)
+  // The caller went away (panel closed, tool cancelled): that is not a gateway
+  // fault, so it must not be reported as one.
+  if (typeof error === 'object' && error?.code === CALLER_ABORTED) return { code: 'aborted', message: '读取被中断' }
+  if (name === 'AbortError' || name === 'TimeoutError' || /\btimed?\s*out\b|\btimeout\b/i.test(message)) {
+    return { code: 'timeout', message: '网关响应超时' }
+  }
+  if (CONNECTION_PHASE_CODES.has(name) || /\bECONN[A-Z]+\b|\bENOTFOUND\b|\bEAI_AGAIN\b/i.test(message)) {
+    return { code: 'connection', message: '连不上 Magpie 网关' }
+  }
+  const status = typeof error?.status === 'number' ? error.status : undefined
+  if (status === 401) return { code: 'unauthorized', message: '网关拒绝：凭据无效' }
+  if (status === 403) return { code: 'forbidden', message: '网关拒绝：权限或风控拦截' }
+  if (status === 429) return { code: 'rate_limited', message: '网关限流，请稍后再试' }
+  if (status !== undefined && status >= 500) return { code: 'server_error', message: `网关内部错误 HTTP ${status}` }
+  if (status !== undefined && status >= 400) return { code: 'bad_request', message: `网关拒绝请求 HTTP ${status}` }
+  return { code: 'unknown', message }
+}
+
 /** Trim to a finite number, or 0. Gateway counters are sometimes absent on old rows. */
 function num(value) {
   const n = typeof value === 'number' ? value : Number(value)
@@ -103,6 +242,15 @@ function num(value) {
 /** Keep only non-empty strings; everything else becomes undefined. */
 function str(value) {
   return typeof value === 'string' && value !== '' ? value : undefined
+}
+
+/** A timestamp the panel can parse whichever shape the gateway used. */
+function stamp(value) {
+  const text = str(value)
+  if (text !== undefined) return text
+  const n = typeof value === 'number' ? value : Number.NaN
+  if (!Number.isFinite(n) || n <= 0) return undefined
+  return new Date(n < 1e12 ? n * 1000 : n).toISOString()
 }
 
 function sendJson(res, status, payload) {
@@ -165,6 +313,47 @@ function trimSeries(series, rate) {
   }))
 }
 
+/**
+ * Per-model throughput the gateway measured itself: tokens per second and
+ * time to first token. `/usage` has no such field, so this is the one place
+ * the panel can show real decoding speed instead of a derived guess.
+ */
+function trimSpeeds(speeds, rate) {
+  if (!Array.isArray(speeds)) return []
+  return speeds.slice(0, 8).map((row) => ({
+    model: str(row.model) ?? '',
+    name: str(row.name) ?? str(row.model) ?? '',
+    requests: num(row.requests),
+    tps: num(row.tps),
+    tpsN: num(row.tps_n),
+    ttftMs: num(row.ttft_ms),
+    cost: toDisplay(rate, row.cost),
+  }))
+}
+
+/**
+ * Where the traffic came through: the gateway itself (`through`), a direct
+ * client (`direct`) or an upstream report (`reported`). All zero except
+ * `through` means everything is proxied by the gateway, which is the normal
+ * case for the harness.
+ */
+function trimChannels(payload, rate) {
+  const pick = (key) => {
+    const row = payload?.[key]
+    if (row === null || typeof row !== 'object') return null
+    return {
+      calls: num(row.calls),
+      errors: num(row.errors),
+      cost: toDisplay(rate, row.cost),
+    }
+  }
+  return {
+    through: pick('through'),
+    direct: pick('direct'),
+    reported: pick('reported'),
+  }
+}
+
 function trimQuotas(quotas) {
   const rows = Array.isArray(quotas?.data) ? quotas.data : []
   return rows.map((row) => ({
@@ -174,9 +363,9 @@ function trimQuotas(quotas) {
     plan: str(row.plan),
     user: str(row.user),
     alias: str(row.alias),
-    readAt: str(row.readAt),
-    until: str(row.until),
-    renew: str(row.renew),
+    readAt: stamp(row.readAt),
+    until: stamp(row.until),
+    renew: stamp(row.renew),
     error: str(row.error),
     windows: Array.isArray(row.windows)
       ? row.windows.map((window) => ({
@@ -185,7 +374,7 @@ function trimQuotas(quotas) {
           // percentage (used + remaining = 100); one decimal is all it means.
           used: Math.round(num(window.used) * 10) / 10,
           remaining: Math.round(num(window.remaining) * 10) / 10,
-          resetsAt: str(window.resetsAt),
+          resetsAt: stamp(window.resetsAt),
           display: str(window.display),
           amount: num(window.amount),
           limit: num(window.limit),
@@ -217,7 +406,7 @@ function trimRequests(payload, limit, rate) {
   const rows = Array.isArray(payload?.rows) ? payload.rows : []
   return rows.slice(0, limit).map((row) => ({
     route_id: str(row.route_id) ?? '',
-    t: str(row.t) ?? '',
+    t: stamp(row.t) ?? '',
     agent: str(row.agent) ?? '',
     agentName: str(row.agentName) ?? str(row.agent) ?? '',
     provider: str(row.provider) ?? '',
@@ -347,7 +536,12 @@ function report(value, recent) {
     }
   }
 
-  if ((value.problems ?? []).length > 0) lines.push(`读数提示：${value.problems.join('；')}`)
+  if ((value.problems ?? []).length > 0) {
+    const items = value.problems.map((p) => (p && typeof p === 'object'
+      ? `${p.what}读取失败：${p.message}`
+      : String(p)))
+    lines.push(`读数提示：${items.join('；')}`)
+  }
   return lines.join('\n')
 }
 
@@ -358,6 +552,7 @@ export function apply(ctx, config) {
     const askedPeriod = str(unwrap(config.period))
     return {
       gatewayUrl: normalizeGateway(unwrap(config.gatewayUrl)) || DEFAULT_GATEWAY,
+      discover: unwrap(config.discover) !== false,
       refreshMs: clampNumber(unwrap(config.refreshMs), 5000, 1000, 120000),
       requestLimit: clampNumber(unwrap(config.requestLimit), 40, 5, 200),
       period: PERIODS.has(askedPeriod) ? askedPeriod : 'today',
@@ -372,23 +567,75 @@ export function apply(ctx, config) {
   /** @type {Map<string, { at: number, value: unknown }>} */
   const cache = new Map()
 
-  async function readUpstream(path, signal, accept, budget) {
-    const target = new URL(path, settings().gatewayUrl)
-    const response = await fetch(target, {
-      headers: { accept },
-      signal: AbortSignal.any([signal, AbortSignal.timeout(budget)]),
-    })
-    if (!response.ok) throw new Error(`${path} answered HTTP ${response.status}`)
+  /**
+   * Reads that have not settled yet, keyed like the cache. Callers that ask
+   * while one is running join it instead of stampeding the gateway.
+   * @type {Map<string, { controller: AbortController, waiters: number, promise: Promise<unknown> }>}
+   */
+  const inflight = new Map()
+
+  /**
+   * The gateway address the last successful read used. When the configured
+   * URL stops answering, discovery may find a different port; remember it so
+   * the next read goes straight there.
+   */
+  let resolvedGateway = null
+
+  /**
+   * Candidate bases in probe order: the configured URL, then what discovery
+   * found, then the historical default. The configured URL wins every time —
+   * discovery is a fallback, not an override.
+   */
+  function gatewayCandidates() {
+    const bases = [settings().gatewayUrl]
+    if (settings().discover) {
+      for (const base of discoverGatewayBases()) {
+        if (!bases.includes(base)) bases.push(base)
+      }
+    }
+    if (resolvedGateway !== null && !bases.includes(resolvedGateway)) bases.unshift(resolvedGateway)
+    return bases
+  }
+
+  async function readUpstream(path, signal, accept, budget, base) {
+    const target = new URL(path, base)
+    let response
+    try {
+      response = await fetch(target, {
+        headers: { accept },
+        signal: AbortSignal.any([signal, AbortSignal.timeout(budget)]),
+      })
+    } catch (error) {
+      // The caller's signal, not the endpoint budget, is what fired: report an
+      // interruption instead of a gateway timeout.
+      if (signal?.aborted) {
+        const aborted = new Error('read aborted by caller')
+        aborted.name = 'AbortError'
+        aborted.code = CALLER_ABORTED
+        throw aborted
+      }
+      // Keep the status so classifyFailure can tell a refused connection from
+      // a rejected request.
+      const failure = new Error(describe(error))
+      failure.name = error instanceof Error ? error.name : 'Error'
+      failure.status = error?.status
+      throw failure
+    }
+    if (!response.ok) {
+      const failure = new Error(`${path} answered HTTP ${response.status}`)
+      failure.status = response.status
+      throw failure
+    }
     return response
   }
 
-  async function readJson(path, signal, budget = TIMEOUT_MS) {
-    const response = await readUpstream(path, signal, 'application/json', budget)
+  async function readJson(path, signal, budget = TIMEOUT_MS, base = null) {
+    const response = await readUpstream(path, signal, 'application/json', budget, base ?? settings().gatewayUrl)
     return await response.json()
   }
 
-  async function readText(path, signal, budget = TIMEOUT_MS) {
-    const response = await readUpstream(path, signal, 'text/plain', budget)
+  async function readText(path, signal, budget = TIMEOUT_MS, base = null) {
+    const response = await readUpstream(path, signal, 'text/plain', budget, base ?? settings().gatewayUrl)
     return await response.text()
   }
 
@@ -397,27 +644,40 @@ export function apply(ctx, config) {
    * gateway that answers it and not the others is still worth drawing, so the
    * rest settle independently and any failure is reported beside the numbers
    * instead of replacing them.
+   *
+   * When the required read fails with a connection error and discovery is
+   * enabled, the other candidate bases are tried once. Magpie writes its live
+   * listen address to `gateway.json`, so a moved port is recovered here
+   * instead of leaving the panel blank.
    */
-  async function snapshot(period, recent, signal) {
+  async function snapshotAt(period, recent, signal, base) {
     const cfg = settings()
     const rate = cfg.currency.rate
-    const usage = await readJson(`/v1/magpie/usage?period=${encodeURIComponent(period)}`, signal)
+    const usage = await readJson(`/v1/magpie/usage?period=${encodeURIComponent(period)}`, signal, TIMEOUT_MS, base)
     const [root, quotas, history, statusline, requests] = await Promise.allSettled([
-      readJson('/', signal),
-      readJson('/v1/magpie/quotas', signal, QUOTA_TIMEOUT_MS),
-      readJson('/v1/magpie/quotas/history', signal, QUOTA_TIMEOUT_MS),
-      readText('/v1/magpie/statusline', signal),
-      readJson(`/v1/magpie/usage/requests?limit=${recent}`, signal, REQUESTS_TIMEOUT_MS),
+      readJson('/', signal, TIMEOUT_MS, base),
+      readJson('/v1/magpie/quotas', signal, QUOTA_TIMEOUT_MS, base),
+      readJson('/v1/magpie/quotas/history', signal, QUOTA_TIMEOUT_MS, base),
+      readText('/v1/magpie/statusline', signal, TIMEOUT_MS, base),
+      // period matters here too: speeds/channels are scoped to the window, and
+      // without it the gateway falls back to its widest default.
+      readJson(`/v1/magpie/usage/requests?period=${encodeURIComponent(period)}&limit=${recent}`, signal, REQUESTS_TIMEOUT_MS, base),
     ])
+    // Problems carry the failure code as well as a sentence, so the panel can
+    // translate the reason instead of showing a raw host string.
     const problems = []
-    if (root.status === 'rejected') problems.push(`网关身份读取失败：${describe(root.reason)}`)
-    if (quotas.status === 'rejected') problems.push(`额度读取失败：${describe(quotas.reason)}`)
-    if (history.status === 'rejected') problems.push(`额度历史读取失败：${describe(history.reason)}`)
-    if (statusline.status === 'rejected') problems.push(`状态行读取失败：${describe(statusline.reason)}`)
-    if (requests.status === 'rejected') problems.push(`最近请求读取失败：${describe(requests.reason)}`)
+    const note = (what, reason) => {
+      const failure = classifyFailure(reason)
+      problems.push({ what, code: failure.code, message: failure.message })
+    }
+    if (root.status === 'rejected') note('网关身份', root.reason)
+    if (quotas.status === 'rejected') note('额度', quotas.reason)
+    if (history.status === 'rejected') note('额度历史', history.reason)
+    if (statusline.status === 'rejected') note('状态行', statusline.reason)
+    if (requests.status === 'rejected') note('最近请求', requests.reason)
     return {
       ok: true,
-      gateway: cfg.gatewayUrl,
+      gateway: base,
       fetchedAt: new Date().toISOString(),
       period,
       config: cfg,
@@ -430,23 +690,118 @@ export function apply(ctx, config) {
       statusline: statusline.status === 'fulfilled' ? String(statusline.value ?? '').trim() : '',
       models: trimModels(usage ?? {}, 6, rate),
       requests: requests.status === 'fulfilled' ? trimRequests(requests.value, recent, rate) : [],
+      // The requests endpoint measures per-model speed and knows which channel
+      // the traffic used; /usage has neither.
+      speeds: requests.status === 'fulfilled' ? trimSpeeds(requests.value?.speeds, rate) : [],
+      channels: requests.status === 'fulfilled' ? trimChannels(requests.value, rate) : null,
       problems,
     }
   }
 
+  async function snapshot(period, recent, signal) {
+    const candidates = gatewayCandidates()
+    let lastError = null
+    for (const base of candidates) {
+      try {
+        const value = await snapshotAt(period, recent, signal, base)
+        resolvedGateway = base
+        return value
+      } catch (error) {
+        lastError = error
+        const failure = classifyFailure(error)
+        if (failure.code === 'aborted') break
+        // A refused connection may mean magpie restarted on another port, so
+        // let the next read look at gateway.json again.
+        if (failure.code === 'connection') invalidateDiscovery()
+        // Only a missing gateway is worth another candidate; an HTTP error
+        // means the base answered, so trying others would be noise.
+        if (failure.code !== 'connection' && failure.code !== 'timeout') break
+        if (signal?.aborted) break
+      }
+    }
+    throw lastError ?? new Error('gateway unreachable')
+  }
+
+  const cacheKeyOf = (base, period, recent) => `${base}|${period}|${recent}`
+
+  function rememberCache(key, value) {
+    cache.set(key, { at: Date.now(), value })
+    if (cache.size > CACHE_MAX) {
+      const oldest = [...cache.entries()].sort((a, b) => a[1].at - b[1].at)[0]
+      if (oldest !== undefined) cache.delete(oldest[0])
+    }
+  }
+
+  /**
+   * Join one shared read. A caller that goes away only leaves the room: the
+   * read is cancelled once nobody is waiting on it any more, so a closing
+   * panel cannot take the agent tool's read down with it.
+   */
+  function joinRead(read, signal) {
+    read.waiters += 1
+    let left = false
+    const leave = () => {
+      if (left) return
+      left = true
+      read.waiters -= 1
+      if (read.waiters <= 0) read.controller.abort()
+    }
+    read.promise.then(leave, leave)
+    if (!signal) return read.promise
+    if (signal.aborted) {
+      leave()
+      const aborted = new Error('read aborted by caller')
+      aborted.name = 'AbortError'
+      aborted.code = CALLER_ABORTED
+      return Promise.reject(aborted)
+    }
+    return new Promise((resolve, reject) => {
+      const onAbort = () => {
+        leave()
+        const aborted = new Error('read aborted by caller')
+        aborted.name = 'AbortError'
+        aborted.code = CALLER_ABORTED
+        reject(aborted)
+      }
+      signal.addEventListener('abort', onAbort, { once: true })
+      read.promise.then(
+        (value) => { signal.removeEventListener('abort', onAbort); resolve(value) },
+        (error) => { signal.removeEventListener('abort', onAbort); reject(error) },
+      )
+    })
+  }
+
+  /**
+   * Read the gateway once per key per window, and once per key in flight.
+   * The panel tick, a manual refresh, a reload and the agent tool all ask in
+   * the same second; without this they each opened their own read.
+   */
   function cachedSnapshot(period, recent, signal, fresh) {
-    const key = `${settings().gatewayUrl}|${period}|${recent}`
+    // The cache key follows the gateway the panel last read successfully, so a
+    // discovered port keeps its own entry instead of colliding with the
+    // configured one.
+    const base = resolvedGateway ?? settings().gatewayUrl
+    const key = cacheKeyOf(base, period, recent)
     if (fresh) cache.delete(key)
     const hit = cache.get(key)
     if (hit !== undefined && Date.now() - hit.at < CACHE_MS) return Promise.resolve(hit.value)
-    return snapshot(period, recent, signal).then((value) => {
-      cache.set(key, { at: Date.now(), value })
-      if (cache.size > CACHE_MAX) {
-        const oldest = [...cache.entries()].sort((a, b) => a[1].at - b[1].at)[0]
-        if (oldest !== undefined) cache.delete(oldest[0])
-      }
-      return value
-    })
+    const running = inflight.get(key)
+    if (running !== undefined) return joinRead(running, signal)
+    const read = { controller: new AbortController(), waiters: 0, promise: null }
+    read.promise = snapshot(period, recent, read.controller.signal)
+      .then((value) => {
+        // Discovery may have answered from another port; store the entry under
+        // the key the next lookup will compute, and drop the one we missed on.
+        const settled = cacheKeyOf(value.gateway ?? base, period, recent)
+        rememberCache(settled, value)
+        if (settled !== key) cache.delete(key)
+        return value
+      })
+      .finally(() => {
+        if (inflight.get(key) === read) inflight.delete(key)
+      })
+    inflight.set(key, read)
+    return joinRead(read, signal)
   }
 
   function parseQuery(req) {
@@ -459,11 +814,15 @@ export function apply(ctx, config) {
 
   const configHandler = async (req, res) => {
     if (req.method !== 'GET') return sendJson(res, 405, { ok: false, error: 'GET only' })
+    const untrusted = isTrustedRequest(req)
+    if (untrusted !== null) return sendJson(res, 403, { ok: false, error: untrusted })
     sendJson(res, 200, { ok: true, config: settings() })
   }
 
   const dataHandler = async (req, res) => {
     if (req.method !== 'GET') return sendJson(res, 405, { ok: false, error: 'GET only' })
+    const untrusted = isTrustedRequest(req)
+    if (untrusted !== null) return sendJson(res, 403, { ok: false, error: untrusted })
     let url
     try {
       url = new URL(req.url || '/', 'http://localhost')
@@ -473,20 +832,42 @@ export function apply(ctx, config) {
     const key = url.searchParams.get('path') || ''
     const upstreamPath = Object.prototype.hasOwnProperty.call(UPSTREAM, key) ? UPSTREAM[key] : null
     if (!upstreamPath) return sendJson(res, 400, { ok: false, error: `unknown path key: ${key}` })
+    const rule = QUERY_RULES[key]
+    const cfg = settings()
 
-    const target = new URL(upstreamPath, settings().gatewayUrl)
+    // Same base the snapshot used: after discovery moved the port, the detail
+    // reads must follow it instead of the configured URL.
+    const target = new URL(upstreamPath, resolvedGateway ?? cfg.gatewayUrl)
     for (const [name, value] of url.searchParams) {
-      if (PASS_QUERY.has(name)) target.searchParams.set(name, value)
+      if (name === 'path') continue
+      if (!rule.allowed.includes(name)) continue
+      target.searchParams.set(name, value)
+    }
+    for (const name of rule.required ?? []) {
+      if (!target.searchParams.has(name)) {
+        return sendJson(res, 400, { ok: false, error: `missing required query: ${name}` })
+      }
     }
 
     try {
+      // The panel closes this read when the user switches away, so stop the
+      // upstream request too instead of leaving it to burn its budget.
+      const stop = new AbortController()
+      req.on('close', () => stop.abort())
+      const budget = AbortSignal.timeout(10000)
+      const signal = typeof AbortSignal.any === 'function' ? AbortSignal.any([stop.signal, budget]) : budget
       const response = await fetch(target, {
         headers: { accept: 'application/json, text/plain;q=0.9, */*;q=0.5' },
-        signal: AbortSignal.timeout(10000),
+        signal,
       })
       const text = await response.text()
       if (!response.ok) {
-        return sendJson(res, 502, { ok: false, error: `gateway HTTP ${response.status}`, body: text.slice(0, 400) })
+        return sendJson(res, 502, {
+          ok: false,
+          error: `gateway HTTP ${response.status}`,
+          code: response.status >= 500 ? 'server_error' : 'bad_request',
+          body: text.slice(0, 400),
+        })
       }
       let data = null
       try {
@@ -502,7 +883,8 @@ export function apply(ctx, config) {
         fetchedAt: Date.now(),
       })
     } catch (error) {
-      return sendJson(res, 502, { ok: false, error: describe(error) })
+      const failure = classifyFailure(error)
+      return sendJson(res, 502, { ok: false, error: failure.message, code: failure.code })
     }
   }
 
@@ -511,6 +893,8 @@ export function apply(ctx, config) {
       res.setHeader('allow', 'GET')
       return sendJson(res, 405, { ok: false, error: 'GET only' })
     }
+    const untrusted = isTrustedRequest(req)
+    if (untrusted !== null) return sendJson(res, 403, { ok: false, error: untrusted })
     const params = parseQuery(req)
     const cfg = settings()
     const asked = params.get('period')
@@ -525,9 +909,11 @@ export function apply(ctx, config) {
       const body = await cachedSnapshot(period, recent, controller.signal, fresh)
       sendJson(res, 200, body)
     } catch (error) {
+      const failure = classifyFailure(error)
       sendJson(res, 502, {
         ok: false,
-        error: controller.signal.aborted ? 'aborted' : describe(error),
+        error: controller.signal.aborted ? 'aborted' : failure.message,
+        code: controller.signal.aborted ? 'aborted' : failure.code,
         gateway: cfg.gatewayUrl,
         fetchedAt: new Date().toISOString(),
       })
@@ -572,11 +958,11 @@ export function apply(ctx, config) {
           name: 'magpie_usage',
           description:
             '查本机 Magpie 网关的用量与额度：调用次数、成本（按配置汇率折算）、输入/输出/缓存 token、各 provider 的额度窗口、模型成本排行、最近请求。'
-            + 'period 缺省取面板设置（today 按小时分桶 / 7d / 30d）；recent 是最近请求条数，默认 5。',
+            + 'period 缺省取面板设置（today 按小时分桶 / 7d / 30d / all）；recent 是最近请求条数，默认 5。',
           parameters: {
             type: 'object',
             properties: {
-              period: { type: 'string', enum: ['today', '7d', '30d'], description: '统计周期，缺省取面板设置' },
+              period: { type: 'string', enum: ['today', '7d', '30d', 'all'], description: '统计周期，缺省取面板设置' },
               recent: { type: 'integer', description: '最近请求条数，1–50，缺省 5' },
             },
             required: [],
